@@ -22,17 +22,16 @@ namespace dapps.client.Transport.Agw;
 /// </summary>
 public sealed class MultiplexedAgwSessionStream : Stream
 {
+    private const int Open = 0;
+    private const int RemotelyClosed = 1;
+    private const int Disposed = 2;
+
     private readonly Pipe incoming = new();
     private readonly Func<byte[], CancellationToken, Task> writeOutgoing;
     private readonly Func<CancellationToken, Task> sendRemoteDisconnect;
-    private bool disposed;
+    private int closeState = Open;
 
-    // Set once the peer side is known to be gone (a 'd' frame arrived, or
-    // the shared AGW socket dropped). AGW frames carry no session id -
-    // BPQ resolves a 'd' by callsign pair - so a 'd' we send after the
-    // peer has already disconnected can land on a *new* session that
-    // reused the same callsign pair and tear it down.
-    private volatile bool remoteClosed;
+    private bool IsDisposed => Volatile.Read(ref closeState) == Disposed;
 
     public MultiplexedAgwSessionStream(
         Func<byte[], CancellationToken, Task> writeOutgoing,
@@ -46,7 +45,7 @@ public sealed class MultiplexedAgwSessionStream : Stream
     /// onto the read side of the stream. Called by the dispatcher.</summary>
     public async ValueTask PushIncoming(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        if (disposed || data.IsEmpty) return;
+        if (IsDisposed || data.IsEmpty) return;
         await incoming.Writer.WriteAsync(data, ct);
     }
 
@@ -55,10 +54,12 @@ public sealed class MultiplexedAgwSessionStream : Stream
     /// arrives, or when the AGW socket itself drops.</summary>
     public void SignalRemoteDisconnect()
     {
-        remoteClosed = true;
+        if (Interlocked.CompareExchange(ref closeState, RemotelyClosed, Open) == Open)
+            CompleteIncoming();
+    }
 
-        // Complete the writer; in-flight Read calls return 0 once the
-        // already-buffered bytes are consumed.
+    private void CompleteIncoming()
+    {
         try { incoming.Writer.Complete(); } catch { /* already completed */ }
     }
 
@@ -99,7 +100,7 @@ public sealed class MultiplexedAgwSessionStream : Stream
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
         if (buffer.IsEmpty) return;
-        if (disposed) throw new IOException("session disposed");
+        if (IsDisposed) throw new IOException("session disposed");
         await writeOutgoing(buffer.ToArray(), ct);
     }
 
@@ -114,16 +115,12 @@ public sealed class MultiplexedAgwSessionStream : Stream
 
     public override async ValueTask DisposeAsync()
     {
-        if (disposed) return;
-        disposed = true;
+        var previousState = Interlocked.Exchange(ref closeState, Disposed);
+        if (previousState == Disposed) return;
 
-        // Only ask BPQ to drop the link if the peer hasn't already done
-        // so. When the peer disconnected first, BPQ has already released
-        // the session and our 'd' would race a reconnect from the same
-        // callsign pair and kill the new session instead.
-        var sendDisconnect = !remoteClosed;
-        SignalRemoteDisconnect();
-        if (sendDisconnect)
+        CompleteIncoming();
+        // Only the open-to-disposed winner may send 'd'; AGW reuses callsign pairs.
+        if (previousState == Open)
         {
             try
             {
@@ -142,12 +139,12 @@ public sealed class MultiplexedAgwSessionStream : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !disposed) { _ = DisposeAsync().AsTask(); }
+        if (disposing && !IsDisposed) { _ = DisposeAsync().AsTask(); }
         base.Dispose(disposing);
     }
 
-    public override bool CanRead => !disposed;
-    public override bool CanWrite => !disposed;
+    public override bool CanRead => !IsDisposed;
+    public override bool CanWrite => !IsDisposed;
     public override bool CanSeek => false;
     public override long Length => throw new NotSupportedException();
     public override long Position
