@@ -27,6 +27,13 @@ public sealed class MultiplexedAgwSessionStream : Stream
     private readonly Func<CancellationToken, Task> sendRemoteDisconnect;
     private bool disposed;
 
+    // Set once the peer side is known to be gone (a 'd' frame arrived, or
+    // the shared AGW socket dropped). AGW frames carry no session id -
+    // BPQ resolves a 'd' by callsign pair - so a 'd' we send after the
+    // peer has already disconnected can land on a *new* session that
+    // reused the same callsign pair and tear it down.
+    private volatile bool remoteClosed;
+
     public MultiplexedAgwSessionStream(
         Func<byte[], CancellationToken, Task> writeOutgoing,
         Func<CancellationToken, Task> sendRemoteDisconnect)
@@ -48,6 +55,8 @@ public sealed class MultiplexedAgwSessionStream : Stream
     /// arrives, or when the AGW socket itself drops.</summary>
     public void SignalRemoteDisconnect()
     {
+        remoteClosed = true;
+
         // Complete the writer; in-flight Read calls return 0 once the
         // already-buffered bytes are consumed.
         try { incoming.Writer.Complete(); } catch { /* already completed */ }
@@ -107,17 +116,26 @@ public sealed class MultiplexedAgwSessionStream : Stream
     {
         if (disposed) return;
         disposed = true;
+
+        // Only ask BPQ to drop the link if the peer hasn't already done
+        // so. When the peer disconnected first, BPQ has already released
+        // the session and our 'd' would race a reconnect from the same
+        // callsign pair and kill the new session instead.
+        var sendDisconnect = !remoteClosed;
         SignalRemoteDisconnect();
-        try
+        if (sendDisconnect)
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            await sendRemoteDisconnect(cts.Token);
-        }
-        catch
-        {
-            // Best-effort: AGW socket may already be gone, the session
-            // may already be torn down on the BPQ side. Don't throw out
-            // of Dispose.
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await sendRemoteDisconnect(cts.Token);
+            }
+            catch
+            {
+                // Best-effort: AGW socket may already be gone, the session
+                // may already be torn down on the BPQ side. Don't throw out
+                // of Dispose.
+            }
         }
         await base.DisposeAsync();
     }

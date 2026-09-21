@@ -92,4 +92,20 @@ public class MultiplexedAgwSessionStreamTests
         disconnectFired.Should().BeTrue(
             "disposing the stream should signal a 'd' frame so BPQ tears down the L2 link rather than leaving it half-up");
     }
+
+    [Fact]
+    public async Task DisposeAsync_AfterRemoteDisconnect_DoesNotSendDisconnect()
+    {
+        var disconnectFired = false;
+        var stream = new MultiplexedAgwSessionStream(
+            writeOutgoing: (_, _) => Task.CompletedTask,
+            sendRemoteDisconnect: _ => { disconnectFired = true; return Task.CompletedTask; });
+
+        stream.SignalRemoteDisconnect();
+        await stream.DisposeAsync();
+
+        disconnectFired.Should().BeFalse(
+            "the peer already hung up, so BPQ has released the session; a late 'd' is addressed by " +
+            "callsign pair only and would tear down a new session that reused the same pair");
+    }
 }
