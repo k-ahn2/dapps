@@ -299,10 +299,16 @@ public sealed class AgwInboundService(
             }
             finally
             {
-                if (sessions.TryRemove(key, out var s))
-                {
-                    try { await s.DisposeAsync(); } catch { /* best effort */ }
-                }
+                // Remove only *our* stream. The 'd' frame handler may
+                // already have removed it, and a reconnect from the same
+                // callsign pair may since have registered a new stream
+                // under this key - removing by key alone would evict and
+                // dispose that one.
+                // (ICollection.Remove is the atomic key+value compare-remove
+                // on net8; ConcurrentDictionary.TryRemove(KeyValuePair) is net9+.)
+                ((ICollection<KeyValuePair<SessionKey, MultiplexedAgwSessionStream>>)sessions)
+                    .Remove(new KeyValuePair<SessionKey, MultiplexedAgwSessionStream>(key, stream));
+                try { await stream.DisposeAsync(); } catch { /* best effort */ }
             }
         }, ct);
     }
