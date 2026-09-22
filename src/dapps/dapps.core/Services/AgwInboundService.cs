@@ -27,11 +27,13 @@ namespace dapps.core.Services;
 /// callsign and the AGW <c>'X'</c> registration is silently inert
 /// (per linbpq apps-interface.md and AGWAPI.c:1427).
 ///
-/// Reconnect policy: on any AGW socket error, sleep
-/// <see cref="ReconnectBackoff"/> and retry. In-flight inbound sessions
-/// are lost (their streams get EOF); the sender's bearer surfaces a
-/// timeout and retries on its next forwarder run - matches the
-/// existing at-least-once semantics.
+/// Reconnect policy: on any AGW socket error, back off along
+/// <see cref="reconnect"/>'s sliding scale (10s x3, 30s x3, 1min x3, then
+/// 5min steady-state) and retry; an operator can jump the queue via the
+/// dashboard's "retry now" (<see cref="InboundReconnectController.TriggerRetry"/>).
+/// In-flight inbound sessions are lost (their streams get EOF); the
+/// sender's bearer surfaces a timeout and retries on its next forwarder
+/// run - matches the existing at-least-once semantics.
 /// </summary>
 public sealed class AgwInboundService(
     IOptionsMonitor<SystemOptions> options,
@@ -42,13 +44,17 @@ public sealed class AgwInboundService(
     OperationalMetrics? metrics = null,
     IDappsTxGate? txGate = null) : IHostedService
 {
-    private static readonly TimeSpan ReconnectBackoff = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan IdleBackoff = TimeSpan.FromSeconds(2);
+    /// <summary>Delay between cycles that ended without a real failure
+    /// (idle-gated on missing config, or a cycle cancelled by a /Config
+    /// save) - deliberately short and flat; the sliding backoff only
+    /// applies to actual connect/socket failures.</summary>
+    private static readonly TimeSpan NonFailureRetryDelay = TimeSpan.FromSeconds(5);
     /// <summary>
     /// AGW keepalive period. BPQ closes idle AGW client connections
     /// after ~20s of no traffic; without a periodic frame from us,
     /// every install with a real BPQ saw an EndOfStreamException +
-    /// reconnect every 25 s (20 s idle + 5 s ReconnectBackoff). The
+    /// reconnect every ~25 s (20 s idle + the reconnect delay). The
     /// 'G' frame queries port count and is the cheapest no-op we can
     /// send - BPQ replies with a 'G' frame, both directions count as
     /// activity, BPQ's idle timer resets. 15s is comfortably under
@@ -59,18 +65,44 @@ public sealed class AgwInboundService(
     private readonly CancellationTokenSource stoppingTokenSource = new();
     private readonly OperationalMetrics metrics = metrics ?? new OperationalMetrics();
     private readonly IDappsTxGate txGate = txGate ?? AlwaysOpenTxGate.Instance;
+    private readonly InboundReconnectController reconnect = new();
     private Task? loopTask;
     private CancellationTokenSource? cycleTokenSource;
     private IDisposable? optionsChangeSubscription;
+
+    /// <summary>Operator-triggered "retry now" - see
+    /// <see cref="InboundReconnectController.TriggerRetry"/>. Publishes
+    /// the collapsed wait immediately so a snapshot fetched right after
+    /// the click doesn't show the stale pre-click countdown.</summary>
+    public bool TriggerManualRetry()
+    {
+        var triggered = reconnect.TriggerRetry();
+        if (triggered) PublishBackoffState();
+        return triggered;
+    }
+
+    /// <summary>Mirrors <see cref="reconnect"/>'s current state into
+    /// <see cref="OperationalMetrics"/> so <c>/Operational</c> can render
+    /// it without depending on this concrete service type.</summary>
+    private void PublishBackoffState() =>
+        metrics.RecordReconnectBackoff("agw", reconnect.FailureStreak, reconnect.NextRetryAtUtc?.UtcDateTime);
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         // Kick the current connect-cycle on any SystemOptions change so
         // a /Config save (callsign, node host/port, bearer flip, RHP
-        // creds) takes effect on the next iteration. Subscribed in
-        // StartAsync so test fixtures that construct the service without
-        // ever calling StartAsync don't accumulate listeners.
-        optionsChangeSubscription = options.OnChange((_, _) => cycleTokenSource?.Cancel());
+        // creds) takes effect on the next iteration - including
+        // collapsing an in-flight backoff wait, so a fix to NodeHost/
+        // AgwPort/Callsign reconnects immediately rather than sitting
+        // out the rest of a (possibly multi-minute) scheduled delay.
+        // Subscribed in StartAsync so test fixtures that construct the
+        // service without ever calling StartAsync don't accumulate
+        // listeners.
+        optionsChangeSubscription = options.OnChange((_, _) =>
+        {
+            cycleTokenSource?.Cancel();
+            reconnect.Interrupt();
+        });
         loopTask = Task.Run(() => RunLoop(stoppingTokenSource.Token));
         return Task.CompletedTask;
     }
@@ -95,6 +127,16 @@ public sealed class AgwInboundService(
             try
             {
                 await RunOnce(cycleCt);
+
+                // Reached here only via a clean return - idle-gated on
+                // missing config, or the cycle token's while-condition
+                // caught a cancellation before the next read threw. Either
+                // way it's not a failure: reset the backoff and reconnect
+                // promptly rather than escalating.
+                reconnect.RecordSuccess();
+                PublishBackoffState();
+                try { await Task.Delay(NonFailureRetryDelay, outerCt); }
+                catch (OperationCanceledException) { return; }
             }
             catch (OperationCanceledException) when (outerCt.IsCancellationRequested)
             {
@@ -102,15 +144,24 @@ public sealed class AgwInboundService(
             }
             catch (OperationCanceledException)
             {
-                // Cycle cancelled by an options change; loop and reconnect.
+                // Cycle cancelled by an options change - not a failure to
+                // back off from, but still pause briefly before the next
+                // attempt (same as the idle-gate case) rather than
+                // reconnecting in a tight loop if options keep changing.
+                reconnect.RecordSuccess();
+                PublishBackoffState();
+                try { await Task.Delay(NonFailureRetryDelay, outerCt); }
+                catch (OperationCanceledException) { return; }
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "AGW inbound loop ended; reconnecting in {0}s", ReconnectBackoff.TotalSeconds);
+                var delay = reconnect.RecordFailure();
+                PublishBackoffState();
+                logger.LogWarning(ex,
+                    "AGW inbound loop ended; reconnecting in {0}s (attempt {1}, next at {2:O})",
+                    delay.TotalSeconds, reconnect.FailureStreak, reconnect.NextRetryAtUtc);
+                await reconnect.WaitAsync(delay, outerCt);
             }
-
-            try { await Task.Delay(ReconnectBackoff, outerCt); }
-            catch (OperationCanceledException) { return; }
         }
     }
 
@@ -152,6 +203,17 @@ public sealed class AgwInboundService(
             new AgwFrame(0, 'X', 0, localCall, "", []), ct);
         metrics.RecordAgwReconnect();
 
+        // Note: the backoff isn't reset here on the raw connect+write - a
+        // persistent post-connect rejection (BPQ accepts the TCP socket
+        // but immediately closes it back, e.g. a firewall RST or BPQ
+        // refusing the client) would otherwise see FailureStreak reset to
+        // 0 right before the resulting ReadFrameAsync failure puts it
+        // straight back to 1, permanently capping the delay at the
+        // ramp's fastest (10s) tier instead of escalating. RecordSuccess()
+        // only fires once BPQ has actually sent us a frame, below -
+        // proof the connection is more than just a TCP handshake.
+        var recordedConnectSuccess = false;
+
         var sessions = new ConcurrentDictionary<SessionKey, MultiplexedAgwSessionStream>();
 
         // Keepalive: send 'G' (port count query) every KeepaliveInterval
@@ -190,6 +252,12 @@ public sealed class AgwInboundService(
             while (!ct.IsCancellationRequested)
             {
                 var frame = await framing.ReadFrameAsync(ct);
+                if (!recordedConnectSuccess)
+                {
+                    recordedConnectSuccess = true;
+                    reconnect.RecordSuccess();
+                    PublishBackoffState();
+                }
                 await Dispatch(frame, framing, sessions, ct);
             }
         }
