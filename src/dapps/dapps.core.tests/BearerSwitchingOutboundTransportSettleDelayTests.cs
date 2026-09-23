@@ -1,5 +1,6 @@
 using System.Text;
 using AwesomeAssertions;
+using dapps.client.Transport;
 using dapps.client.Transport.Agw;
 using dapps.client.Tx;
 using dapps.core.Models;
@@ -148,6 +149,34 @@ public sealed class BearerSwitchingOutboundTransportSettleDelayTests
         await conn.DisposeAsync();
         await node;
         peers.IsActive(RemoteA, out _).Should().BeFalse("our 'd' has gone out, so the peer is free to dial again");
+    }
+
+    // #185: WouldDialIntoOpenSession in OutboundMessageManager runs once,
+    // early - before the settle-gate wait and the connect round trip
+    // below, both of which take real time. An inbound session from the
+    // very peer being dialled can be registered in that gap. This is the
+    // re-check that closes it: it must run immediately before the dial,
+    // so a peer that only became busy *after* the forwarder's own check
+    // still gets caught, and - the actual regression - no SABM ever
+    // reaches the wire once it is.
+
+    [Fact]
+    public async Task PeerAlreadyHasASessionOpen_ThrowsWithoutEverDialling()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var peers = new PeerSessionRegistry();
+        using var host = new FakeAgwHost();
+        var transport = MakeTransport(host, new ObservableTimeProvider(), TimeSpan.Zero, peers);
+
+        using (peers.Acquire(RemoteA, "inbound"))
+        {
+            await transport.Invoking(t => t.ConnectAsync(Local, RemoteA, 0, ct))
+                .Should().ThrowAsync<PeerSessionBusyException>()
+                .Where(ex => ex.PeerCallsign == RemoteA && ex.OpenDirection == "inbound");
+
+            host.Pending().Should().BeFalse(
+                "the point of the check is that it runs before the dial - a live inbound session must never see a competing SABM");
+        }
     }
 
     [Fact]

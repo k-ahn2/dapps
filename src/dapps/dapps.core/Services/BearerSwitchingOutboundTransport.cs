@@ -69,11 +69,26 @@ public sealed class BearerSwitchingOutboundTransport(
         }
         await settle.WaitAsync(key, stoppingToken);
 
-        // #178: register the link so the forwarder leaves this peer
+        // #178/#185: register the link so the forwarder leaves this peer
         // alone until it is torn down (a scheduled poll or probe can be
         // mid-session with the same callsign when the forwarder ticks).
-        // Released on dispose, or right away when the connect fails.
-        var lease = peerSessions?.Acquire(remoteCallsign, "outbound");
+        // TryAcquire (rather than an unconditional Acquire) makes this
+        // the authoritative check, not just bookkeeping: it runs
+        // immediately before the dial, under the same lock as the check
+        // itself, so an inbound session that appeared after
+        // OutboundMessageManager's own (earlier, advisory) check can
+        // still be caught here - the last point at which backing off
+        // still means no SABM went out. Released on dispose, or right
+        // away when the connect fails.
+        IDisposable? lease = null;
+        if (peerSessions is not null)
+        {
+            lease = peerSessions.TryAcquire(remoteCallsign, "outbound", out var openDirection);
+            if (lease is null)
+            {
+                throw new PeerSessionBusyException(remoteCallsign, openDirection!);
+            }
+        }
 
         IDappsConnection inner;
         try

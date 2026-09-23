@@ -343,6 +343,15 @@ public class OutboundMessageManager(
     /// claims) and a session with that peer is already open in either
     /// direction. UDP and MeshCore are datagram bearers with no link to
     /// collide on, so their routes are never deferred.
+    ///
+    /// #185: this check runs once, early - before the settle-gate wait
+    /// and the AGW/RHP connect round trip that follow it, both of which
+    /// take real time. It's a fast path that skips the whole pipeline in
+    /// the common case, not the only guard: a session from this same
+    /// peer that appears after this check passes is still caught by
+    /// <see cref="PeerSessionRegistry.TryAcquire"/> in
+    /// <see cref="BearerSwitchingOutboundTransport"/>, immediately
+    /// before the dial - see that class for why the gap matters.
     /// </summary>
     private bool WouldDialIntoOpenSession(BackhaulRoute route, out string? openDirection)
     {

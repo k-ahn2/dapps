@@ -136,6 +136,28 @@ public sealed class Dappsv1SessionBackhaulTests
         result.Error.Should().Be("kaboom");
     }
 
+    [Fact]
+    public async Task SendAsync_TransportSaysPeerSessionBusy_ReturnsDeferredNotFailed()
+    {
+        // #185: BearerSwitchingOutboundTransport's own last-moment check
+        // can decline a dial the forwarder's earlier check already let
+        // through. That must land here as a defer (message stays
+        // queued, no cooldown, no route outcome recorded), the same as
+        // any other #178 non-send - not as a failure.
+        var transport = new ThrowingTransport(new PeerSessionBusyException("N0DEST", "inbound"));
+        var sb = new Dappsv1SessionBackhaul(transport, NullLoggerFactory.Instance);
+
+        var result = await sb.SendAsync(
+            new BackhaulMessage("middefer", "app@N0DEST", null, null, "x"u8.ToArray()),
+            new BackhaulRoute("N0DEST"),
+            "N0SRC",
+            CancellationToken.None);
+
+        result.Accepted.Should().BeFalse();
+        result.Deferred.Should().BeTrue("a busy peer is not a failure of the route");
+        result.Error.Should().Contain("N0DEST").And.Contain("inbound");
+    }
+
     private static Dappsv1SessionBackhaul MakeBackhaul(byte[] cannedReceiverBytes)
         => new(new FakeOutboundTransport(cannedReceiverBytes), NullLoggerFactory.Instance);
 

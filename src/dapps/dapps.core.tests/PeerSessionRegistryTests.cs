@@ -68,6 +68,41 @@ public sealed class PeerSessionRegistryTests
         registry.IsActive("M0AHN-3", out _).Should().BeFalse();
     }
 
+    // #185: TryAcquire is the authoritative, race-free version of
+    // "check IsActive, then Acquire" - the two steps happen under the
+    // same lock, so nothing can register a session for the peer in the
+    // gap between them the way it could between two separate calls.
+
+    [Fact]
+    public void TryAcquire_PeerIsIdle_SucceedsAndTheLeaseMarksItBusy()
+    {
+        var registry = new PeerSessionRegistry();
+
+        var lease = registry.TryAcquire("M0AHN-3", "outbound", out var openDirection);
+
+        lease.Should().NotBeNull();
+        openDirection.Should().BeNull();
+        registry.IsActive("M0AHN-3", out var direction).Should().BeTrue();
+        direction.Should().Be("outbound");
+
+        lease!.Dispose();
+        registry.IsActive("M0AHN-3", out _).Should().BeFalse();
+    }
+
+    [Fact]
+    public void TryAcquire_PeerAlreadyHasASession_FailsAndReportsWhichDirection()
+    {
+        var registry = new PeerSessionRegistry();
+        using var existing = registry.Acquire("M0AHN-3", "inbound");
+
+        var lease = registry.TryAcquire("M0AHN-3", "outbound", out var openDirection);
+
+        lease.Should().BeNull("a second link on the same callsign pair would reset the first");
+        openDirection.Should().Be("inbound");
+        registry.IsActive("M0AHN-3", out var direction).Should().BeTrue("the failed attempt must not disturb the existing lease");
+        direction.Should().Be("inbound");
+    }
+
     [Fact]
     public async Task WaitUntilIdle_CompletesWhenTheLastLeaseIsReleased_AndAtOnceForAnIdlePeer()
     {

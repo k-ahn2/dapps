@@ -80,6 +80,40 @@ public sealed class PeerSessionRegistry
         return false;
     }
 
+    /// <summary>Atomically acquires a lease only if no session with the
+    /// peer is open yet; otherwise returns null and reports the
+    /// direction of whatever is already open. Unlike calling
+    /// <see cref="IsActive"/> and then <see cref="Acquire"/> separately,
+    /// nothing can register a session for the peer in between the check
+    /// and the acquire - both happen under the same lock.
+    ///
+    /// Why this exists (#185): <see cref="OutboundMessageManager"/> asks
+    /// <see cref="IsActive"/> once, early, before the settle-gate wait
+    /// and the AGW/RHP connect round trip that follow it - both take
+    /// real time. An inbound session from the very peer being dialled
+    /// can be handed to us in that window, after the early check passed
+    /// but before our SABM actually reaches BPQ, and nothing re-checks.
+    /// This is that re-check, called from
+    /// <see cref="BearerSwitchingOutboundTransport"/> immediately before
+    /// the dial - the last point at which declining still means we
+    /// never sent a frame.</summary>
+    public IDisposable? TryAcquire(string peerCallsign, string direction, out string? openDirection)
+    {
+        lock (gate)
+        {
+            if (open.TryGetValue(peerCallsign, out var existing) && existing.Count > 0)
+            {
+                openDirection = existing[0].Direction;
+                return null;
+            }
+            openDirection = null;
+            var lease = new Lease(this, peerCallsign, direction);
+            open[peerCallsign] = [lease];
+            Signal();
+            return lease;
+        }
+    }
+
     /// <summary>Completes once no session with the peer is open;
     /// immediately if none is. Exposed for tests, which otherwise have
     /// no sleep-free way to wait for a handler's teardown to release
