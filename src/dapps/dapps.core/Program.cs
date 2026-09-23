@@ -10,12 +10,9 @@ using dapps.core.Services;
 using dapps.core.Updater;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.Extensions.Options;
+using Scalar.AspNetCore;
 using MQTTnet.AspNetCore;
 using System.Net.Sockets;
-// OpenAPI / Scalar dropped in the .NET 8 rollback - the native
-// OpenAPI generation (AddOpenApi / MapOpenApi) is a .NET 9+ API.
-// To revisit once we're back on a newer .NET runtime.
-
 // Plan C5.2 - CLI side-doors that don't boot the host.
 // Recognised: --version, --check-update, --apply-update, --rollback.
 // Returning before CreateBuilder runs means these work even when the
@@ -46,6 +43,10 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 builder.Services.AddControllers();
 builder.Services.AddRazorPages();
+// OpenAPI document for the REST surface, served at /openapi/v1.json, with
+// Scalar as the viewer at /scalar. Both sit behind AdminAuthMiddleware
+// like the rest of the dashboard.
+builder.Services.AddOpenApi();
 // SystemOptions: hot-reloadable IOptionsMonitor backed by the
 // systemoptions SQLite table. ConfigController.Post calls
 // store.SaveAsync(...) to persist + fire OnChange; bearer services
@@ -169,8 +170,13 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<MqttBrokerService>
 // one idles. Switching bearers via /Config fires the OnChange handler
 // on each, which cancels the active connection cycle so the loop
 // re-evaluates with the new value (hot-reload, no restart).
-builder.Services.AddHostedService<AgwInboundService>();
-builder.Services.AddHostedService<Rhpv2InboundService>();
+// Registered as singletons (not just AddHostedService<T>) so
+// OperationalController can resolve the concrete instances directly -
+// each exposes a manual "retry now" trigger the dashboard surfaces.
+builder.Services.AddSingleton<AgwInboundService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgwInboundService>());
+builder.Services.AddSingleton<Rhpv2InboundService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Rhpv2InboundService>());
 builder.Services.AddHostedService<TtlSweeperService>();
 builder.Services.AddHostedService<StreamGapSweeperService>();
 builder.Services.AddSingleton<Database>();
@@ -197,6 +203,11 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         options.ExpireTimeSpan = TimeSpan.FromDays(90);
         options.SlidingExpiration = true;
     });
+// Per-destination sliding-scale backoff so a destination that connects
+// fine but rejects at the application layer (e.g. BPQ's "No AGWPE Host
+// Sessions available" instead of the DAPPSv1> prompt) doesn't get
+// re-dialled on every 5s forwarder tick forever.
+builder.Services.AddSingleton<OutboundDestinationBackoff>();
 builder.Services.AddSingleton<OutboundMessageManager>();
 // B5 routing seam - IRoutingAlgorithm is the strategy, IRoutingContext
 // is the slice of node state it reads. Two stacks shipped today;
@@ -357,6 +368,11 @@ app.UseWebSockets();
 app.MapMqtt("/mqtt");
 app.MapControllers();
 app.MapRazorPages();
+app.MapOpenApi();
+app.MapScalarApiReference(options =>
+{
+    options.OpenApiRoutePattern = "/openapi/v1.json";
+});
 // Plan G - mount the MCP endpoint at /mcp. The MCP transport
 // negotiates streamable-HTTP / SSE itself; we just need the route
 // reachable. Allowlisted in AdminAuthMiddleware alongside /Health.
