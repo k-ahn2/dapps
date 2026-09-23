@@ -233,6 +233,20 @@ public sealed class Dappsv1SessionBackhaul : IDappsBackhaul
 
             return BackhaulSendResult.Ok();
         }
+        catch (PeerSessionBusyException ex)
+        {
+            // #185: the transport's own last-moment check caught what
+            // OutboundMessageManager's earlier check missed - a session
+            // with this peer opened in the gap between that check and
+            // this dial actually reaching BPQ. Same non-outcome as any
+            // other #178 defer: nothing failed, so no cooldown and
+            // nothing for the route to learn from.
+            logger.LogInformation(
+                "Deferring {0}: {1} already has an {2} session open, dialling now would reset it",
+                message.Id, ex.PeerCallsign, ex.OpenDirection);
+            return BackhaulSendResult.Defer(
+                $"{ex.PeerCallsign} already has an {ex.OpenDirection} session open");
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Backhaul send failed for {0} to {1}", message.Id, route.Callsign);
