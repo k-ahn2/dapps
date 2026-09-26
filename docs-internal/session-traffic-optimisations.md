@@ -17,7 +17,10 @@ Proposals 1-3 need no wire-protocol change and would bring the same exchange
 down to 1-2 connections and about 85 frames. Adding 4 and 5 gets it to about
 40 frames. A connection tail (9) holds the link open through a burst, so
 messages mid-burst skip the reconnect entirely; it needs a small negotiated
-protocol addition so the called node can say it has traffic.
+protocol addition so the called node can say it has traffic. Deflate
+compression (10) is already in the protocol and every daemon can receive
+it; only sending is missing. Both 9 and 10 can be set per neighbour, so
+they can be turned off for debugging.
 
 All code references are to `c6b62e8` (0.39.0).
 
@@ -151,8 +154,8 @@ grows with bursts rather than with every message.
 **Change.** Options:
 - Drop fields that are at their defaults (`gt=0`, `fmt=p`).
 - Encode `s=` and `ttl=` more compactly.
-- Once batching exists, compress all payloads in a batch together
-  (`fmt=d`). Compressing each 200-byte JSON message on its own gains little.
+- Once batching exists, compress all payloads in a batch together.
+  Per-message payload compression is proposal 10.
 
 **Benefit.** The header is ~75% of payload size for small messages;
 trimming it is the largest remaining per-message byte saving.
@@ -173,7 +176,7 @@ in its `ack` line or prompt. The caller skips `rev` when there are none.
 
 **Change.** After a session that carried application traffic, the caller
 keeps the link open for a configurable idle time (`SessionTailSeconds`,
-default 540 s). The timer restarts whenever a message moves in either
+default 540 s, overridable per neighbour; see "Configuration" below). The timer restarts whenever a message moves in either
 direction. When it runs out, the caller sends a final `rev`, then `quit`
 and DISC. Both ends can send while the link is held:
 
@@ -195,7 +198,7 @@ margin: the caller closes cleanly just before a node would cut the link.
 
 Negotiation: the caller sends `tail <seconds>\n` after the first prompt (or
 as part of the capability negotiation in proposal 4). A new callee replies
-`ok tail <seconds>`, capped at its own maximum, and from then on may send
+`ok tail <seconds>`, capped at its own setting for the caller, and from then on may send
 `pending`. An old callee replies `eh?`, and the caller does not hold the
 link: holding would only keep the callee's own traffic for us stuck behind
 `PeerSessionRegistry` until we disconnect.
@@ -263,10 +266,95 @@ callee half.
   neighbours. Cap the number of tails held at once, and cap total session
   length (e.g. `SessionMaxMinutes`) so a chatty pair can't hold a link
   forever.
-- **Operator controls.** `SessionTailSeconds = 0` turns it off. A
-  per-neighbour override can come later, e.g. a shorter tail through a busy
-  shared node or a path with a shorter timeout, and the 9-minute default on
-  a quiet point-to-point link.
+- **Configuration.** A system default (`DAPPS_SESSION_TAIL_SECONDS`, 540)
+  and a nullable `SessionTailSeconds` on the neighbour row, following the
+  `BearerPort` pattern: null uses the default, 0 turns the tail off for that
+  peer. Each end applies its own row for the other, and the agreed tail is
+  the lower of the two. Typical uses: a shorter tail through a busy shared
+  node or a path with a shorter timeout; 0 while debugging, so every
+  exchange is its own session, as today; the default on a quiet
+  point-to-point link.
+
+### 10. Compress payloads when it saves bytes
+
+**Change.** Send `fmt=d` (raw deflate) for a payload when the compressed
+form is actually smaller, and plain `fmt=p` otherwise. The decision is made
+per message by trying it: compress, and use the result only if `clen` plus
+the ` clen=NNN` field it adds saves at least a minimum (e.g. 16 bytes).
+Don't bother trying below about 64 bytes, where deflate can't win. There's
+no guessing by content type: already-compressed or encrypted payloads just
+fail the test and go plain.
+
+The receiver has handled `fmt=d` since v0.1.0
+(`InboundConnectionHandler.HandleData`). Only the sending side is missing:
+`DappsProtocolClient.SendMessageAsync` throws `NotImplementedException` for
+anything other than plain (`DappsProtocolClient.cs:148-151`). The `rev`
+drain uses the same method, so both directions get it.
+
+**Benefit.** Deflate (level 9) on sample payloads of the kinds in use:
+
+| Payload | Plain | Deflate | Sent as |
+|---|---|---|---|
+| wps-repl data, ~200 B JSON | 205 B | 164 B | `d`, saves ~32 B after `clen=` |
+| wps-repl `{"op":"ack"}` | 40 B | 39 B | `p` (below threshold) |
+| Mail/bulletin text | 300 B+ | typically a third smaller or better, improving with length | `d` |
+
+In the trace that's about 8 × 32 ≈ 250 bytes, about 2 s of airtime at 1200
+baud: worthwhile but modest. The gain is much bigger for longer text (mail,
+bulletins), which is where users feel the transfer time. Small JSON gains
+far more from a shared dictionary, as MeshCore already does (zstd with a
+dictionary trained on DAPPS traffic, `dapps.meshcore/DappsCompression.cs`).
+Offering that on DAPPSv1 as a second format (e.g. `fmt=z` plus a dictionary
+version) is a later, negotiated step alongside 7.
+
+**Protocol.** None for deflate: it's in the spec (`fmt=d`, `clen=`) and every
+reference daemon accepts it. The message id is the hash of the uncompressed
+payload and `len` is the uncompressed length, so ids and deduplication are
+unaffected, and each hop decides for itself whether to compress when it
+forwards.
+
+**Configuration.** Like the tail, a system default plus a per-neighbour
+override on the neighbour row:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Compress when it saves at least the minimum |
+| `off` | Always send plain |
+| `on` | Always compress, even when it doesn't save anything (interop testing of the receive path) |
+
+System default `DAPPS_COMPRESSION` (`auto`); neighbour row `Compression`,
+null = use the default. It governs only what this node *sends* to that peer;
+compressed payloads we receive are always accepted. Reasons to turn it off:
+- Debugging: payloads stay readable on a monitor or in a trace. The analysis
+  in this document depended on that.
+- A third-party implementation that mishandles `fmt=d`.
+- Ruling compression out while chasing a fault.
+
+The existing global `MeshCoreCompress` could later move to the same
+per-neighbour setting.
+
+**Must handle.**
+- Log and audit both `len` and `clen`, so the saving is visible and a
+  compressed message can be matched to its plain content when debugging.
+- Metrics: bytes saved per peer, so operators can see whether `auto` is
+  doing anything on their traffic.
+- The PACLEN arithmetic from proposal 3 uses the bytes on the wire (`clen`),
+  not `len`.
+
+## Configuration
+
+Proposals 9 and 10 add two per-peer settings. Both follow the existing
+`BearerPort` pattern: a system default in `SystemOptions`, plus a nullable
+column on `DbNeighbour` where null means "use the default".
+
+| Setting | System default | Neighbour column | Off |
+|---|---|---|---|
+| Connection tail | `DAPPS_SESSION_TAIL_SECONDS` = 540 | `SessionTailSeconds` (int?) | `0` |
+| Payload compression | `DAPPS_COMPRESSION` = `auto` | `Compression` (`auto`/`off`/`on`, null) | `off` |
+
+A peer that calls in without a neighbour row gets the system defaults. Both
+need to be settable through the web UI and the MCP config tools, like the
+other neighbour fields.
 
 ## Expected effect on the captured exchange
 
@@ -280,9 +368,13 @@ These are estimates from the trace, not measurements.
 | 1 + 2 + 3 + 9 | 1 | 4 | ~75 |
 | 1 + 2 + 3 + 9 + 4a + 5 | 1 | ~1 (per batch of 4) | ~40, with no reconnect delay for traffic mid-burst |
 
+Compression (10) doesn't change the frame counts here much: it saves about
+250 bytes (about 2 s of airtime) on this exchange, and more on longer text.
+
 ## Suggested order
 
-1. **3** - trivial, no protocol change, immediate saving.
+1. **3** and **10** - small, no protocol change, immediate saving. Do them
+   together, since both change `SendMessageAsync`.
 2. **1**, then **2** - the largest saving, no protocol change.
 3. **5** - raise with wps-repl.
 4. **6** - docs, once 1 is in.
