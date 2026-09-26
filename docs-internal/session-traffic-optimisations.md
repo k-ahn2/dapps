@@ -15,7 +15,9 @@ connections, using about 150 frames**. Most of that is overhead:
 
 Proposals 1-3 need no wire-protocol change and would bring the same exchange
 down to 1-2 connections and about 85 frames. Adding 4 and 5 gets it to about
-40 frames.
+40 frames. A connection tail (9) holds the link open through a burst, so
+messages mid-burst skip the reconnect entirely; it needs a small negotiated
+protocol addition so the called node can say it has traffic.
 
 All code references are to `c6b62e8` (0.39.0).
 
@@ -71,8 +73,8 @@ session, and its `rev` drain already sends several messages per session.
 ### 2. Check the queue again before disconnecting
 
 **Change.** After the `rev` drain, if messages for this peer were queued
-during the session, offer them before DISC. Optionally, keep the link open
-for a configurable idle time (10-20 s) before disconnecting.
+during the session, offer them before DISC. Keeping the link open for
+longer than that is proposal 9.
 
 **Benefit.** Covers messages that arrive while a session is open, which
 batching alone misses. In the trace, the reconnect 2 s after each DISC would
@@ -167,6 +169,105 @@ in its `ack` line or prompt. The caller skips `rev` when there are none.
 
 **Protocol.** Yes, negotiated.
 
+### 9. Connection tail: hold the link open through a burst
+
+**Change.** After a session that carried application traffic, the caller
+keeps the link open for a configurable idle time (`SessionTailSeconds`,
+default 540 s). The timer restarts whenever a message moves in either
+direction. When it runs out, the caller sends a final `rev`, then `quit`
+and DISC. Both ends can send while the link is held:
+
+- **Caller side (no protocol change).** When the forwarder finds a peer with
+  an open *outbound* session, it hands the message to that session instead
+  of deferring it. The session wakes and runs `ihave`/`send`/`data`/`ack`
+  straight away. `PeerSessionRegistry` becomes the place to find the open
+  session, not just a flag that one exists.
+- **Callee side (negotiated).** The callee can only send inside a `rev`
+  drain, and the caller is sitting silent waiting for input. So a new
+  unsolicited line: when the callee is idle at its prompt and has something
+  for the caller, it writes `pending\n`. The caller answers with `rev` and
+  the existing drain runs.
+
+**Why 9 minutes.** The live network already uses a 9-minute application
+keepalive to stay under the 10-minute idle timeouts some nodes enforce on
+circuits. A tail that ends after 9 minutes of inactivity uses the same
+margin: the caller closes cleanly just before a node would cut the link.
+
+Negotiation: the caller sends `tail <seconds>\n` after the first prompt (or
+as part of the capability negotiation in proposal 4). A new callee replies
+`ok tail <seconds>`, capped at its own maximum, and from then on may send
+`pending`. An old callee replies `eh?`, and the caller does not hold the
+link: holding would only keep the callee's own traffic for us stuck behind
+`PeerSessionRegistry` until we disconnect.
+
+**Why `pending` rather than fully symmetric sessions.** Letting either end
+send `ihave` at any time means both sides must multiplex one reader across
+their own exchange and the peer's, and two `ihave`s crossing on the air
+leave each side reading an offer where it expected `send`. With `pending`,
+the callee stays the command server and the caller stays the only one
+issuing commands. If `pending` crosses with a caller `ihave`, nothing
+breaks: the callee handles the `ihave` as normal, and the caller notes the
+`pending` whenever it reads it and issues `rev` once its exchange finishes.
+It costs one extra turnaround per callee burst compared with symmetric
+sessions.
+
+**Benefit.**
+- In the trace, all traffic falls within about 70 s (08:11:03 to 08:12:12),
+  so the tail makes the 6 sessions one, including the session that carried
+  only the wps-repl ack. On its own that's about 45 frames saved;
+  on top of 1 and 2 it saves the one remaining reconnect (about 8 frames).
+- Latency during a burst: a message queued mid-tail starts moving at once,
+  instead of waiting for the next forwarder tick, `LinkSettleGate`, SABM/UA
+  and the `DAPPSv1>` prompt (several seconds per message at 1200 baud). This
+  is where users notice it.
+- With 9 minutes, bursts that are minutes apart (a conversation, a
+  replication catch-up in stages) also share one session, not only messages
+  seconds apart.
+- An idle AX.25 link costs almost no airtime: nothing is sent except the T3
+  keepalive (an RR poll and reply every 3 min by default). A full 9-minute
+  tail that catches no more traffic costs about 6 frames, less than one
+  reconnect.
+- While the link is held, neither node dials the other, so the crossed
+  connects from #178/#185 can't happen for that pair.
+
+**Protocol.** Yes, negotiated (`tail`, `ok tail`, `pending`). The caller-side
+half works with any peer but, as above, shouldn't be used without the
+callee half.
+
+**Must handle.**
+- **Read timeouts.** Both ends drop a session after 3 min without a line,
+  well short of the 9-minute default. In tail mode both ends' idle read
+  timeout becomes the agreed tail plus a margin (e.g. 30 s), so the caller's
+  `quit` always arrives before the callee gives up. The 3-min timeout still
+  applies while an exchange is in progress (waiting for `send`, `data`,
+  `ack`), so a dead peer mid-exchange is noticed as quickly as today.
+- **Caller waits on two things.** The idle caller must wait for a line from
+  the peer *and* for a message from its own forwarder, without cancelling a
+  half-read line. That means one long-running read loop feeding the session
+  logic, not a read call per step.
+- **Node timeouts.** 9 minutes sits under the common 10-minute node
+  timeouts, but some nodes or multi-hop NET/ROM paths may use shorter ones.
+  The T3 RR polls are link-layer only and can't be relied on to count as
+  activity for a node's idle timer. So: the callee's `ok tail` can cap the
+  tail to fit its own node, the sysop can set a lower value, and a link the
+  node drops mid-tail is treated as the normal end of the tail, not a
+  failure (no routing penalty, no backoff).
+- **Closing races.** If `pending` crosses with the caller's `quit`, the
+  callee's message stays queued and goes on its next forwarder tick. A final
+  `rev` just before `quit` keeps that window small.
+- **Which sessions hold.** Only sessions that moved application messages.
+  Reverse-poll sweeps, route exchanges and discovery sessions close as they
+  do today, so a node doesn't keep links open to every neighbour it polls.
+- **Node resources.** A held link takes up a node stream/circuit for up to
+  9 minutes after the last message, which matters more on a node with many
+  neighbours. Cap the number of tails held at once, and cap total session
+  length (e.g. `SessionMaxMinutes`) so a chatty pair can't hold a link
+  forever.
+- **Operator controls.** `SessionTailSeconds = 0` turns it off. A
+  per-neighbour override can come later, e.g. a shorter tail through a busy
+  shared node or a path with a shorter timeout, and the 9-minute default on
+  a quiet point-to-point link.
+
 ## Expected effect on the captured exchange
 
 These are estimates from the trace, not measurements.
@@ -176,6 +277,8 @@ These are estimates from the trace, not measurements.
 | Today | 6 | 4 | ~150 |
 | 1 + 2 + 3 | 1-2 | 4 | ~85 |
 | + 4a + 5 | 1 | ~1 (per batch of 4) | ~40 |
+| 1 + 2 + 3 + 9 | 1 | 4 | ~75 |
+| 1 + 2 + 3 + 9 + 4a + 5 | 1 | ~1 (per batch of 4) | ~40, with no reconnect delay for traffic mid-burst |
 
 ## Suggested order
 
@@ -183,4 +286,6 @@ These are estimates from the trace, not measurements.
 2. **1**, then **2** - the largest saving, no protocol change.
 3. **5** - raise with wps-repl.
 4. **6** - docs, once 1 is in.
-5. **4**, **7**, **8** - together, behind one capability negotiation.
+5. **9**, **4**, **7**, **8** - together, behind one capability negotiation.
+   Of these, 9 does most for how responsive things feel during a burst, and
+   it's the one to do first if the negotiation is built in stages.
