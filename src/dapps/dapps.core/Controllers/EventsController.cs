@@ -85,11 +85,10 @@ public sealed class EventsController(
     [HttpGet("queue")]
     public async Task<QueueSnapshot> GetQueueSnapshot()
     {
-        var local = options.CurrentValue.Callsign.Split('-')[0];
+        var local = options.CurrentValue.Callsign;
         var recent = (await database.GetRecentMessages(50)).ToList();
 
-        bool IsLocal(DbMessage m) =>
-            string.Equals(m.Destination.Split('@').Last().Split('-')[0], local, StringComparison.OrdinalIgnoreCase);
+        bool IsLocal(DbMessage m) => DestinationParser.IsLocal(m.Destination, local);
 
         QueueRow Row(DbMessage m, string? appOverride = null) => new(
             Id: m.Id,
@@ -100,7 +99,7 @@ public sealed class EventsController(
             Ttl: m.Ttl,
             AgeSeconds: (int)Math.Max(0, (DateTime.UtcNow - m.CreatedAt).TotalSeconds));
 
-        var outbound = recent.Where(m => !m.Forwarded && !IsLocal(m)).Select(m => Row(m)).ToList();
+        var outbound = recent.Where(m => !m.Forwarded && !m.LocallyDelivered && !IsLocal(m)).Select(m => Row(m)).ToList();
         var inbox = recent.Where(m => !m.LocallyDelivered && IsLocal(m))
             .Select(m => Row(m, m.Destination.Split('@')[0]))
             .ToList();

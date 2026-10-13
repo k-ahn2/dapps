@@ -23,13 +23,16 @@ public class Database(
     {
         var connection = DbInfo.GetAsyncConnection();
         // Outbound = destined for a remote node and not yet forwarded.
-        // "Local" matches when the @-suffix of Destination matches our base callsign.
+        // "Local" is our own callsign, SSID included (DestinationParser.IsLocal).
+        // A row an app here has acked never goes: before 0.46.3 mail for
+        // another SSID of ours was taken as local (#239), and that old,
+        // already delivered mail must not start moving after an upgrade.
         // Oldest first, so a batch for one neighbour goes out in the order
         // its messages were queued.
-        var local = options.CurrentValue.Callsign.Split('-')[0];
+        var (local, local0) = DestinationParser.LocalLikePatterns(options.CurrentValue.Callsign);
         var rows = await connection.QueryAsync<DbMessage>(
-            "select * from messages where forwarded=0 and not (destination like ?) order by CreatedAt asc;",
-            $"%@{local}%");
+            "select * from messages where forwarded=0 and locallydelivered=0 and not (destination like ? escape '\\' or destination like ? escape '\\') order by CreatedAt asc;",
+            local, local0);
         return rows;
     }
 
@@ -54,10 +57,10 @@ public class Database(
     public async Task<ICollection<DbMessage>> GetPendingOutboundMessagesQueuedSince(DateTime since)
     {
         var connection = DbInfo.GetAsyncConnection();
-        var local = options.CurrentValue.Callsign.Split('-')[0];
+        var (local, local0) = DestinationParser.LocalLikePatterns(options.CurrentValue.Callsign);
         var rows = await connection.QueryAsync<DbMessage>(
-            "select * from messages where forwarded=0 and CreatedAt >= ? and not (destination like ?) order by CreatedAt asc;",
-            since, $"%@{local}%");
+            "select * from messages where forwarded=0 and locallydelivered=0 and CreatedAt >= ? and not (destination like ? escape '\\' or destination like ? escape '\\') order by CreatedAt asc;",
+            since, local, local0);
         return rows;
     }
 
@@ -65,12 +68,12 @@ public class Database(
     public async Task<ICollection<DbMessage>> GetUnacknowledgedLocalMessagesForApp(string appName)
     {
         var connection = DbInfo.GetAsyncConnection();
-        var local = options.CurrentValue.Callsign.Split('-')[0];
-        // Destination shape is `app@call[-ssid]`; match exact app + local-callsign prefix.
-        var prefix = $"{appName}@{local}";
+        // Destination shape is `app@call[-ssid]`; match this app at our own
+        // callsign, SSID included.
+        var (local, local0) = DestinationParser.LocalLikePatterns(options.CurrentValue.Callsign, appName);
         var rows = await connection.QueryAsync<DbMessage>(
-            "select * from messages where locallydelivered=0 and (destination=? or destination like ?);",
-            prefix, $"{prefix}-%");
+            "select * from messages where locallydelivered=0 and (destination like ? escape '\\' or destination like ? escape '\\');",
+            local, local0);
         return rows;
     }
 
@@ -347,10 +350,10 @@ public class Database(
     public async Task<int> CountPendingOutbound()
     {
         var connection = DbInfo.GetAsyncConnection();
-        var local = options.CurrentValue.Callsign.Split('-')[0];
+        var (local, local0) = DestinationParser.LocalLikePatterns(options.CurrentValue.Callsign);
         return await connection.ExecuteScalarAsync<int>(
-            "select count(*) from messages where forwarded=0 and not (destination like ?);",
-            $"%@{local}%");
+            "select count(*) from messages where forwarded=0 and locallydelivered=0 and not (destination like ? escape '\\' or destination like ? escape '\\');",
+            local, local0);
     }
 
     /// <summary>Undelivered local rows - messages destined for a local
@@ -358,10 +361,10 @@ public class Database(
     public async Task<int> CountUndeliveredLocal()
     {
         var connection = DbInfo.GetAsyncConnection();
-        var local = options.CurrentValue.Callsign.Split('-')[0];
+        var (local, local0) = DestinationParser.LocalLikePatterns(options.CurrentValue.Callsign);
         return await connection.ExecuteScalarAsync<int>(
-            "select count(*) from messages where locallydelivered=0 and (destination like ?);",
-            $"%@{local}%");
+            "select count(*) from messages where locallydelivered=0 and (destination like ? escape '\\' or destination like ? escape '\\');",
+            local, local0);
     }
 
     /// <summary>
