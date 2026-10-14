@@ -176,6 +176,13 @@ public static class DbStartup
         // Offers used to be stored until their payload came; a session
         // keeps them itself now. Drop the table an older version left.
         db.Execute("drop table if exists offers");
+        // Learned routes and discovered paths were keyed by base callsign
+        // until 0.47.0, and live in new tables keyed by the full callsign
+        // now (#242). The old ones go: they are runtime state and relearn.
+        // New tables rather than reshaped old ones, so a downgrade finds
+        // no table it can't open, and simply starts with empty ones.
+        db.Execute("drop table if exists learnedroutes");
+        db.Execute("drop table if exists discoveredpaths");
         db.CreateTable<DbMessage>();
         db.CreateTable<DbSystemOption>();
         db.CreateTable<DbRouteHint>();

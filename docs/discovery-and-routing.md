@@ -63,6 +63,8 @@ The actual forwarding partners. Two ways a row lands here:
 
 Each neighbour row carries: callsign, bearer port (for AGW or RHPv2), UDP endpoint (for the datagram bearer), and an optional cost override.
 
+Enter a neighbour under its DAPPS callsign with the SSID. Mail goes to the neighbour with the exact call+SSID first. One entered under another SSID of the same callsign still works as a stand-in, and the Neighbours panel marks it so you can tidy it up.
+
 ## The two routing algorithms
 
 Selected via `DAPPS_ROUTING_ALGORITHM` (restart required).
@@ -73,6 +75,8 @@ AODV-flavoured. Routes are learned from observed forwards: when a message is for
 
 Looks at the message destination, walks: explicit per-destination route hint → known-good neighbour → discovered peer → previously-learned route. First match wins.
 
+Learned routes are kept per station, SSID included: a route to `G6FCI-7` says nothing about `G6FCI-8`, and two nodes under one callsign learn routes to each other like any other pair.
+
 Works well on small meshes. The trade-off is no proactive route discovery - destinations not yet seen via traffic are unknown until a forward goes through us.
 
 ### `meshcore`
@@ -81,17 +85,21 @@ DSR-flavoured. The sender stamps the path on the message; intermediate nodes fol
 
 ## Route gossip
 
-Once two DAPPS nodes have a session open for real work (a push, a probe, a reverse poll), they piggyback a `routes` exchange to share what they know about further-reach destinations. The receiver writes each gossiped route into its `learnedroutes` table marked `source=gossip`; the existing failure-counter machinery invalidates anything that turns out not to work.
+Once two DAPPS nodes have a session open for real work (a push, a probe, a reverse poll), they piggyback a `routes` exchange to share what they know about further-reach destinations. The receiver writes each gossiped route into its learned-routes table marked `source=gossip`; the existing failure-counter machinery invalidates anything that turns out not to work.
 
 Bounded by a per-(local, remote) staleness gate: at most one pull per `RouteGossipStalenessHours` (default 6h) per neighbour, regardless of session frequency. No scheduled transmission - if there's no traffic and no probes, no gossip exchange happens. Setting `RouteGossipStalenessHours=0` disables it entirely.
 
 The advertiser filters: only routes whose failure counter is zero, only routes the daemon itself has actually traversed, never gossip-imported routes (don't re-export hearsay). Manual neighbours are always advertised since they're the most-trusted class.
+
+Each route is advertised under the destination's full callsign, SSID included, so two SSIDs of one callsign are two routes. Every node needs 0.47.0 or later for this to help; with an older node on either end the route simply goes unused, and mail falls back to the other ways of finding a path.
 
 The dashboard's learned-routes view marks gossip-sourced rows distinctly from traffic-learned ones. Resolution priority unchanged: hint → neighbour → discovered → learned (gossip and traffic share the learned tier).
 
 ## Route hints
 
 A manual override. The `/RouteHints` endpoint (and dashboard panel) let you say "for messages destined for X, always try Y first." Useful for steering around a known-broken link, or for asymmetric routing where the natural route in one direction differs from the other.
+
+A hint for a callsign without an SSID (`G6FCI`) covers every SSID of that callsign. One with an SSID (`G6FCI-8`) covers that station only, and wins over one without. A hint for `*` catches anything else.
 
 ## Reaching nodes through non-DAPPS intermediates
 

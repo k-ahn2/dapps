@@ -11,20 +11,24 @@ namespace dapps.core.Models;
 /// source teaches us the reverse direction. <c>To reach the
 /// originator, send via the neighbour that handed me this message.</c>
 ///
-/// One row per destination base callsign - newer observations
+/// One row per destination station, SSID included - newer observations
 /// overwrite older ones. Future work could keep a candidate list per
 /// destination with weighting, but a single best-effort entry is
 /// enough for the v0.x phase.
 /// </summary>
-[Table("learnedroutes")]
+// "learnedroutes2": the table was "learnedroutes", keyed by base
+// callsign, until 0.47.0 (#242). A new name rather than a migration, so a
+// downgrade finds no table of the wrong shape and starts.
+[Table("learnedroutes2")]
 public class DbLearnedRoute
 {
-    /// <summary>Base callsign (no SSID) - keyed this way so messages
-    /// to <c>chat@G0FOO-1</c> and <c>mail@G0FOO-9</c> share the same
-    /// learned route. SSID-specific routing is rare in practice and
-    /// handled by manual neighbours when needed.</summary>
+    /// <summary>The destination's full callsign, SSID included, in
+    /// <see cref="dapps.core.Services.DestinationParser.StationKey"/> form
+    /// (upper case, no "-0"): G0FOO-1 and G0FOO-9 are two stations and
+    /// keep a route each (#242). Before 0.47.0 this was the base
+    /// callsign, in the old "learnedroutes" table.</summary>
     [PrimaryKey]
-    public string DestinationBaseCallsign { get; set; } = "";
+    public string DestinationCallsign { get; set; } = "";
 
     /// <summary>Full callsign with SSID of the next-hop neighbour -
     /// matches a <see cref="DbNeighbour.Callsign"/> row so the
