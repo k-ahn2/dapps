@@ -1,6 +1,8 @@
 using dapps.core.Models;
 using Microsoft.Extensions.Options;
 using MQTTnet;
+using MQTTnet.Formatter;
+using MQTTnet.Protocol;
 using MQTTnet.Server;
 using System.Text;
 
@@ -38,12 +40,30 @@ public sealed class MqttBrokerService(
     private const string OutTopicPrefix = "dapps/out/";
     private const string InTopicPrefix = "dapps/in/";
     private const string AckTopicPrefix = "dapps/ack/";
+    private const string DappsTopicRoot = "dapps";
 
-    /// <summary>Tracks which app a connected MQTT client authenticated as,
-    /// keyed on ClientId. When auth is required, publish/subscribe
-    /// interceptors check this to enforce topic-app scoping.</summary>
-    private readonly Dictionary<string, string> clientApps = new(StringComparer.Ordinal);
+    /// <summary>One connected client: the app it authenticated as (null
+    /// when it connected without valid credentials, which is only allowed
+    /// while auth is off), the MQTT version it speaks, the remote endpoint
+    /// of this particular connection (so a late disconnect of an older
+    /// connection with the same ClientId can't remove this one), and the
+    /// app's token generation seen before its token was checked.</summary>
+    private sealed record ClientEntry(
+        string? App, MqttProtocolVersion ProtocolVersion, string? Endpoint, long TokenGeneration);
+
+    /// <summary>Every connected MQTT client, keyed on ClientId. When auth
+    /// is required, the publish/subscribe interceptors check the app here
+    /// to enforce topic-app scoping.</summary>
+    private readonly Dictionary<string, ClientEntry> clientApps = new(StringComparer.Ordinal);
     private readonly object clientAppsLock = new();
+
+    /// <summary>Bumped each time an app's token is issued, rotated or
+    /// revoked (case-insensitive, as app names are). A CONNECT captures
+    /// it before checking the token and re-checks it once the client is
+    /// registered, so a revoke that lands while the token check is still
+    /// running can't let the connection through. Guarded by
+    /// <see cref="clientAppsLock"/>.</summary>
+    private readonly Dictionary<string, long> tokenGenerations = new(StringComparer.OrdinalIgnoreCase);
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -53,7 +73,9 @@ public sealed class MqttBrokerService(
         server.InterceptingPublishAsync += OnInterceptingPublish;
         server.InterceptingSubscriptionAsync += OnInterceptingSubscription;
         server.ClientSubscribedTopicAsync += OnClientSubscribedTopic;
+        server.ClientConnectedAsync += OnClientConnected;
         server.ClientDisconnectedAsync += OnClientDisconnected;
+        tokens.TokenChanged += OnTokenChanged;
 
         logger.LogInformation(
             "MQTT broker: TCP :{port}, WebSocket /mqtt (auth required: {auth})",
@@ -70,8 +92,62 @@ public sealed class MqttBrokerService(
         server.InterceptingPublishAsync -= OnInterceptingPublish;
         server.InterceptingSubscriptionAsync -= OnInterceptingSubscription;
         server.ClientSubscribedTopicAsync -= OnClientSubscribedTopic;
+        server.ClientConnectedAsync -= OnClientConnected;
         server.ClientDisconnectedAsync -= OnClientDisconnected;
+        tokens.TokenChanged -= OnTokenChanged;
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Disconnect every live MQTT client authenticated as
+    /// <paramref name="app"/>. The token is only checked at CONNECT, so
+    /// without this a revoked or rotated token would keep working on an
+    /// already open connection. The app reconnects with its new token, or
+    /// is refused if it has none. Returns how many clients were dropped.
+    /// </summary>
+    public async Task<int> DisconnectAppAsync(string app)
+    {
+        string[] ids;
+        lock (clientAppsLock)
+        {
+            ids = clientApps
+                .Where(kv => kv.Value.App is not null
+                    && string.Equals(kv.Value.App, app, StringComparison.OrdinalIgnoreCase))
+                .Select(kv => kv.Key)
+                .ToArray();
+        }
+        var dropped = 0;
+        foreach (var id in ids)
+        {
+            try
+            {
+                await server.DisconnectClientAsync(id, MqttDisconnectReasonCode.NotAuthorized);
+                dropped++;
+                logger.LogInformation("MQTT: disconnected client {0} (app {1}) after its token changed", id, app);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "MQTT: could not disconnect client {0} (app {1})", id, app);
+            }
+        }
+        return dropped;
+    }
+
+    private void OnTokenChanged(string app)
+    {
+        lock (clientAppsLock)
+        {
+            tokenGenerations[app] = tokenGenerations.GetValueOrDefault(app) + 1;
+        }
+        _ = DisconnectAppAsync(app);
+    }
+
+    private long TokenGeneration(string app)
+    {
+        lock (clientAppsLock)
+        {
+            return tokenGenerations.GetValueOrDefault(app);
+        }
     }
 
     /// <summary>
@@ -137,8 +213,12 @@ public sealed class MqttBrokerService(
 
     public async Task InjectInboundMessage(DbMessage message)
     {
-        var (app, _) = DestinationParser.Parse(message.Destination);
-        if (app.Length == 0) return;
+        // The app is everything before the last '@', the same split the
+        // ack and replay queries use (app@CALL patterns), so whatever is
+        // delivered on dapps/in/<app> can be acked on dapps/ack/<app>.
+        var at = message.Destination.LastIndexOf('@');
+        if (at <= 0) return;
+        var app = message.Destination[..at];
 
         var topic = InTopicPrefix + app;
         var builder = new MqttApplicationMessageBuilder()
@@ -207,7 +287,10 @@ public sealed class MqttBrokerService(
     /// plaintext. When <see cref="SystemOptions.AuthRequired"/> is true,
     /// rejects with NotAuthorized on missing or invalid creds.
     /// On accept, records ClientId → app-name so the publish/subscribe
-    /// interceptors can enforce topic-app scoping.
+    /// interceptors can enforce topic-app scoping. A connection accepted
+    /// without valid credentials (auth off) is recorded with no app, so
+    /// it never inherits the app of an earlier connection with the same
+    /// ClientId that it takes over.
     /// </summary>
     private async Task OnValidatingConnection(ValidatingConnectionEventArgs e)
     {
@@ -222,42 +305,110 @@ public sealed class MqttBrokerService(
             {
                 e.ReasonCode = MQTTnet.Protocol.MqttConnectReasonCode.BadUserNameOrPassword;
                 logger.LogInformation("MQTT: rejected client {0} - missing credentials", e.ClientId);
+                return;
             }
+            Remember(e, null, 0);
             return;
         }
 
+        // Captured before the token check, which can take a while (one
+        // PBKDF2 per stored token): if the app's token changes meanwhile,
+        // this connection must not go through on the old one.
+        var generation = TokenGeneration(e.UserName!);
         var app = await tokens.VerifyAsync(e.Password!);
-        if (app is null || !string.Equals(app, e.UserName, StringComparison.OrdinalIgnoreCase))
+        if (app is null
+            || !string.Equals(app, e.UserName, StringComparison.OrdinalIgnoreCase)
+            || TokenGeneration(app) != generation)
         {
             if (authRequired)
             {
                 e.ReasonCode = MQTTnet.Protocol.MqttConnectReasonCode.BadUserNameOrPassword;
                 logger.LogInformation("MQTT: rejected client {0} - invalid credentials", e.ClientId);
+                return;
             }
+            Remember(e, null, 0);
             return;
         }
 
+        Remember(e, app, generation);
+        logger.LogInformation("MQTT: client {0} authenticated as {1}", e.ClientId, app);
+    }
+
+    private void Remember(ValidatingConnectionEventArgs e, string? app, long generation)
+    {
         lock (clientAppsLock)
         {
-            clientApps[e.ClientId] = app;
+            clientApps[e.ClientId] = new ClientEntry(app, e.ProtocolVersion, e.Endpoint, generation);
         }
-        logger.LogInformation("MQTT: client {0} authenticated as {1}", e.ClientId, app);
+    }
+
+    /// <summary>
+    /// Second half of the revoke race guard. The token-changed sweep only
+    /// finds clients MQTTnet has registered, and a CONNECT can be between
+    /// its token check and registration when the token changes. Once the
+    /// client is registered, compare the app's token generation with the
+    /// one captured before the check, and drop the client if it moved.
+    /// A change after this point is caught by the sweep.
+    /// </summary>
+    private Task OnClientConnected(ClientConnectedEventArgs e)
+    {
+        var entry = Lookup(e.ClientId);
+        if (entry?.App is { } app
+            && entry.Endpoint == e.Endpoint
+            && TokenGeneration(app) != entry.TokenGeneration)
+        {
+            logger.LogInformation("MQTT: disconnecting client {0} (app {1}): its token changed while it was connecting",
+                e.ClientId, app);
+            // Not awaited inline: the connection is still finishing its
+            // own setup on this call.
+            _ = Task.Run(async () =>
+            {
+                try { await server.DisconnectClientAsync(e.ClientId, MqttDisconnectReasonCode.NotAuthorized); }
+                catch (Exception ex) { logger.LogWarning(ex, "MQTT: could not disconnect client {0}", e.ClientId); }
+            });
+        }
+        return Task.CompletedTask;
+    }
+
+    private ClientEntry? Lookup(string clientId)
+    {
+        lock (clientAppsLock)
+        {
+            return clientApps.GetValueOrDefault(clientId);
+        }
     }
 
     private Task OnClientDisconnected(MQTTnet.Server.ClientDisconnectedEventArgs e)
     {
+        // A session takeover (the same ClientId connecting again while the
+        // broker still holds the old socket) disconnects the old
+        // connection after the new one has been validated and recorded.
+        // Removing the entry then would strip the new connection's app.
+        if (e.DisconnectType == MqttClientDisconnectType.Takeover) return Task.CompletedTask;
         lock (clientAppsLock)
         {
-            clientApps.Remove(e.ClientId);
+            // The new connection's entry is written during its CONNECT
+            // validation, before MQTTnet marks the old one as taken over.
+            // If the old socket dies in that gap its disconnect is an
+            // ordinary one, so only remove the entry if it is this
+            // connection's.
+            if (clientApps.TryGetValue(e.ClientId, out var entry)
+                && (entry.Endpoint is null || e.Endpoint is null || entry.Endpoint == e.Endpoint))
+            {
+                clientApps.Remove(e.ClientId);
+            }
         }
         return Task.CompletedTask;
     }
 
     /// <summary>
-    /// SUBSCRIBE-time topic scope. When auth is required, only the
-    /// authenticated app may subscribe to its own <c>dapps/in/&lt;app&gt;</c>;
-    /// other DAPPS topics aren't subscribable by clients (they're
-    /// app→DAPPS direction).
+    /// SUBSCRIBE-time check. When auth is required, a filter starting
+    /// <c>dapps/in/</c> must be exactly the authenticated app's own
+    /// <c>dapps/in/&lt;app&gt;</c>, so <c>dapps/in/other</c>,
+    /// <c>dapps/in/+</c> and <c>dapps/in/#</c> are refused. Broader
+    /// filters such as <c>dapps/#</c> or <c>#</c> are not restricted:
+    /// apps on one node may read each other's inbound traffic by design;
+    /// tokens stop them interfering (publishing and acking), not reading.
     /// </summary>
     private Task OnInterceptingSubscription(InterceptingSubscriptionEventArgs e)
     {
@@ -271,14 +422,11 @@ public sealed class MqttBrokerService(
             return Task.CompletedTask;
         }
 
-        string? authedApp;
-        lock (clientAppsLock)
-        {
-            clientApps.TryGetValue(e.ClientId, out authedApp);
-        }
+        var authedApp = Lookup(e.ClientId)?.App;
         if (authedApp is null)
         {
             e.ProcessSubscription = false;
+            e.Response.ReasonCode = MqttSubscribeReasonCode.NotAuthorized;
             return Task.CompletedTask;
         }
 
@@ -288,6 +436,7 @@ public sealed class MqttBrokerService(
             logger.LogInformation("MQTT: client {0} (auth={1}) blocked from subscribing to {2}",
                 e.ClientId, authedApp, topic);
             e.ProcessSubscription = false;
+            e.Response.ReasonCode = MqttSubscribeReasonCode.NotAuthorized;
         }
         return Task.CompletedTask;
     }
@@ -299,12 +448,14 @@ public sealed class MqttBrokerService(
         if (string.IsNullOrEmpty(e.ClientId)) return;
 
         var topic = e.ApplicationMessage.Topic;
+
+        // Topics outside dapps/ are not part of the DAPPS protocol; let
+        // them flow (apps may use the broker for their own coordination).
+        if (topic != DappsTopicRoot && !topic.StartsWith(DappsTopicRoot + "/", StringComparison.Ordinal)) return;
+
         var authRequired = options.CurrentValue.AuthRequired;
-        string? authedApp = null;
-        if (authRequired)
-        {
-            lock (clientAppsLock) clientApps.TryGetValue(e.ClientId, out authedApp);
-        }
+        var client = Lookup(e.ClientId);
+        var authedApp = authRequired ? client?.App : null;
 
         if (topic.StartsWith(OutTopicPrefix, StringComparison.Ordinal))
         {
@@ -314,7 +465,7 @@ public sealed class MqttBrokerService(
             if (slash <= 0 || slash == rest.Length - 1)
             {
                 logger.LogWarning("MQTT: ignoring publish to malformed topic {0}", topic);
-                e.ProcessPublish = false;
+                Refuse(e, MqttPubAckReasonCode.TopicNameInvalid);
                 return;
             }
             var app = rest[..slash];
@@ -324,7 +475,7 @@ public sealed class MqttBrokerService(
             {
                 logger.LogInformation("MQTT: client {0} (auth={1}) blocked from publishing on {2}",
                     e.ClientId, authedApp ?? "?", topic);
-                e.ProcessPublish = false;
+                Refuse(e, MqttPubAckReasonCode.NotAuthorized);
                 return;
             }
 
@@ -374,7 +525,12 @@ public sealed class MqttBrokerService(
             }
             catch (Exception ex)
             {
+                // Never let the app think a message it handed us is safe
+                // when it is not stored: report the failure instead of a
+                // success PUBACK.
                 logger.LogError(ex, "MQTT: failed to persist outbound publish on {0}", topic);
+                FailStore(e, client);
+                return;
             }
 
             // Don't fan out the dapps/out/* publish to subscribers - it's
@@ -390,40 +546,72 @@ public sealed class MqttBrokerService(
             {
                 logger.LogInformation("MQTT: client {0} (auth={1}) blocked from publishing on {2}",
                     e.ClientId, authedApp ?? "?", topic);
-                e.ProcessPublish = false;
+                Refuse(e, MqttPubAckReasonCode.NotAuthorized);
                 return;
             }
 
             var id = Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment).Trim();
+            e.ProcessPublish = false;
             if (id.Length > 0)
             {
                 try
                 {
-                    await database.MarkLocallyDelivered(id);
-                    logger.LogInformation("MQTT: ack received for {0}", id);
+                    // Only the app's own inbound messages can be acked: never
+                    // another app's, and never a queued outbound or transit
+                    // message, which would then silently never be forwarded.
+                    if (await database.MarkLocallyDeliveredForApp(ackApp, id))
+                    {
+                        logger.LogInformation("MQTT: ack received for {0}", id);
+                    }
+                    else
+                    {
+                        logger.LogInformation("MQTT: client {0} acked {1}, which is not a message for app {2}; ignored",
+                            e.ClientId, id, ackApp);
+                        Refuse(e, MqttPubAckReasonCode.NotAuthorized);
+                    }
                 }
                 catch (Exception ex)
                 {
                     logger.LogError(ex, "MQTT: failed to mark {0} delivered", id);
+                    FailStore(e, client);
                 }
             }
-
-            e.ProcessPublish = false;
             return;
         }
 
-        if (topic.StartsWith(InTopicPrefix, StringComparison.Ordinal))
-        {
-            // Apps shouldn't be publishing to in/* - it's DAPPS→app only.
-            // Block but don't error noisily.
-            logger.LogDebug("MQTT: blocking client publish to in-topic {0}", topic);
-            e.ProcessPublish = false;
-            return;
-        }
-
-        // Any other topics are not part of the DAPPS protocol; let them flow
-        // (apps may use the broker for their own coordination if they want).
+        // Every other dapps/ topic is written by DAPPS alone: dapps/in/*
+        // (DAPPS to app), dapps/metrics/* and dapps/audit/*. A client
+        // publish there, retained or not, could fake a delivery or a
+        // heartbeat, so it is refused.
+        logger.LogInformation("MQTT: client {0} blocked from publishing on {1}", e.ClientId, topic);
+        Refuse(e, MqttPubAckReasonCode.NotAuthorized);
     }
+
+    /// <summary>Drop a client publish and say why in the PUBACK (MQTT 5;
+    /// MQTT 3.1.1 has no reason codes, so those clients still see a plain
+    /// PUBACK).</summary>
+    private static void Refuse(InterceptingPublishEventArgs e, MqttPubAckReasonCode reason)
+    {
+        e.ProcessPublish = false;
+        e.Response.ReasonCode = reason;
+    }
+
+    /// <summary>
+    /// Storing a publish failed. An MQTT 5 client gets an error PUBACK; an
+    /// MQTT 3.1.1 PUBACK cannot carry an error, so that connection is
+    /// closed instead of acknowledging. A QoS 1 client with a persistent
+    /// session (clean session off) re-sends on reconnect; otherwise the
+    /// app sees the publish fail.
+    /// </summary>
+    private static void FailStore(InterceptingPublishEventArgs e, ClientEntry? client)
+    {
+        Refuse(e, MqttPubAckReasonCode.ImplementationSpecificError);
+        if (client?.ProtocolVersion != MqttProtocolVersion.V500)
+        {
+            e.CloseConnection = true;
+        }
+    }
+
 
     private async Task OnClientSubscribedTopic(ClientSubscribedTopicEventArgs e)
     {
