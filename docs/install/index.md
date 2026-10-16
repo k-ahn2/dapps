@@ -55,3 +55,11 @@ A running DAPPS node writes:
 It opens an outbound TCP connection to your packet node's bearer port - AGW (default 8000 on BPQ) or RHPv2 (default 9000 on XRouter), depending on `DAPPS_NODE_BEARER`.
 
 The full list of operator-tunable knobs is on the [Configure](../configure.md) page.
+
+## Security, out of the box
+
+A fresh node listens on every network interface, not just localhost, for both the dashboard (TCP 5000) and the MQTT broker (TCP 1883). Until you finish the `/Setup` wizard, the dashboard has no password at all, and the MQTT broker has nothing in front of it either. This is fine on a trusted home or club LAN, but if the node is reachable from anywhere you don't trust, finish `/Setup` straight away, and either bind the dashboard to localhost with `ASPNETCORE_URLS=http://127.0.0.1:5000` or put a firewall in front of both ports until you have.
+
+New installs also require an app token for MQTT and REST: apps must authenticate before they can publish, subscribe or call `/AppApi`. Mint one on the dashboard's **App tokens** page (sidebar, under System) - type an app name, copy the plaintext shown once. Scripting it instead needs the admin cookie first, so see [Authentication](../app-developers/reference.md#authentication) in the app-developers reference for the two-step curl recipe. An install upgraded from an older version keeps whatever it already had set, so a running app is never locked out by an update.
+
+An install whose database is moved or emptied comes back up as a brand new install: it lands back on `/Setup` and requires an app token again, even if the previous database had `AuthRequired` turned off.

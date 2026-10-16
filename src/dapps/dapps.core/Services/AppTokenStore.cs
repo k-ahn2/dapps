@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using dapps.core.Models;
+using SQLite;
 
 namespace dapps.core.Services;
 
@@ -25,7 +26,17 @@ public sealed class AppTokenStore(ILogger<AppTokenStore> logger)
     /// Generate a fresh token for <paramref name="appName"/>, store its
     /// hash, and return the plaintext for the caller to hand to the app
     /// owner. Re-issuing for an existing app rotates: the prior token
-    /// stops working immediately.
+    /// stops verifying straight away, so REST calls using it fail on
+    /// their very next request. An MQTT client that's already connected
+    /// keeps working until it disconnects and reconnects, though - the
+    /// broker only checks the token at CONNECT, not per message.
+    ///
+    /// Looks up any existing row for <paramref name="appName"/> case-
+    /// insensitively, so rotating "chat" also replaces a pre-existing
+    /// "Chat" row rather than leaving two rows for what callers treat as
+    /// one app (callers normalise new input to lowercase before calling
+    /// this - see <see cref="TryNormalizeAppName"/> - but older rows
+    /// written before that existed may still carry mixed case).
     /// </summary>
     public async Task<string> CreateOrRotateAsync(string appName)
     {
@@ -34,11 +45,9 @@ public sealed class AppTokenStore(ILogger<AppTokenStore> logger)
         var hash = Pbkdf2(plaintext, salt);
 
         var connection = DbInfo.GetAsyncConnection();
-        var existing = await connection.FindAsync<DbAppToken>(appName);
-        if (existing != null)
-        {
-            await connection.DeleteAsync<DbAppToken>(appName);
-        }
+        // Every row for this name, whatever its case: databases from before
+        // names were normalised can hold both "Chat" and "chat".
+        await connection.ExecuteAsync("delete from apptokens where AppName = ? collate nocase", appName);
 
         await connection.InsertAsync(new DbAppToken
         {
@@ -79,12 +88,17 @@ public sealed class AppTokenStore(ILogger<AppTokenStore> logger)
         return null;
     }
 
-    /// <summary>Remove a token. Returns true if a row was deleted.</summary>
+    /// <summary>Remove a token, matching <paramref name="appName"/>
+    /// case-insensitively against whatever's stored (see
+    /// <see cref="CreateOrRotateAsync"/>). Returns true if a row was
+    /// deleted. Immediate for REST; an already-connected MQTT client for
+    /// that app keeps working until it next reconnects (see
+    /// <see cref="CreateOrRotateAsync"/> for why).</summary>
     public async Task<bool> RevokeAsync(string appName)
     {
         var connection = DbInfo.GetAsyncConnection();
         var deleted = await connection.ExecuteAsync(
-            "delete from apptokens where AppName=?", appName);
+            "delete from apptokens where AppName = ? collate nocase", appName);
         return deleted > 0;
     }
 
@@ -103,6 +117,45 @@ public sealed class AppTokenStore(ILogger<AppTokenStore> logger)
         var connection = DbInfo.GetAsyncConnection();
         var count = await connection.ExecuteScalarAsync<int>("select count(*) from apptokens");
         return count > 0;
+    }
+
+    /// <summary>
+    /// Validates and lowercases a candidate app name to what the app
+    /// interface actually accepts. The app name becomes an MQTT topic
+    /// segment (<c>dapps/in/&lt;app&gt;</c> etc.) and the <c>{app}</c>
+    /// REST route segment, so '/', '+', '#' (MQTT topic wildcards and
+    /// separator) and whitespace would either break topic matching or
+    /// never round-trip through a URL cleanly; control characters are
+    /// rejected for the same reason nothing else accepts them. Lower-
+    /// cases the result because MQTT CONNECT and the REST bearer check
+    /// both compare app names case-insensitively already (see
+    /// <see cref="MqttBrokerService"/> and <see cref="BearerAuthMiddleware"/>) -
+    /// "chat" and "Chat" are the same app, so this store should only
+    /// ever mint one token for either spelling.
+    /// </summary>
+    public static bool TryNormalizeAppName(string? raw, out string normalized, out string? error)
+    {
+        var trimmed = (raw ?? "").Trim();
+        if (trimmed.Length == 0)
+        {
+            normalized = "";
+            error = "App name is required.";
+            return false;
+        }
+
+        foreach (var c in trimmed)
+        {
+            if (c > '~' || char.IsWhiteSpace(c) || char.IsControl(c) || c is '/' or '+' or '#')
+            {
+                normalized = "";
+                error = "App name must be plain ASCII and can't contain '/', '+', '#', whitespace, or control characters.";
+                return false;
+            }
+        }
+
+        normalized = trimmed.ToLowerInvariant();
+        error = null;
+        return true;
     }
 
     private static byte[] Pbkdf2(string plaintext, byte[] salt)

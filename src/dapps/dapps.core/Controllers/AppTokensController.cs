@@ -8,10 +8,14 @@ namespace dapps.core.Controllers;
 /// plaintext token exactly once - capture it on creation and hand it
 /// to the app owner, because we only store the hash.
 ///
-/// This endpoint is unauthenticated by design: pairing it with bearer
-/// auth would be a chicken-and-egg on first use. The README's
-/// getting-started warns operators to bind the REST surface to
-/// loopback (or a trusted LAN) until proper admin auth lands.
+/// Gated by <see cref="dapps.core.Services.AdminAuthMiddleware"/> like
+/// the rest of the dashboard's admin surface (the operator's cookie,
+/// not a bearer token) - it is deliberately not paired with
+/// <see cref="dapps.core.Services.BearerAuthMiddleware"/>'s per-app
+/// token check, which would be a chicken-and-egg on first use. The
+/// dashboard's <c>/Tokens</c> page (<see cref="dapps.core.Pages.AppTokensModel"/>)
+/// is the operator-facing front end for this; the app-developers
+/// reference's Authentication section covers scripting it directly.
 /// </summary>
 [ApiController]
 [Route("[controller]")]
@@ -26,12 +30,12 @@ public class AppTokensController(AppTokenStore store) : ControllerBase
     [HttpPost]
     public async Task<ActionResult<CreateAppTokenResponse>> CreateOrRotate([FromBody] CreateAppTokenRequest req)
     {
-        if (string.IsNullOrWhiteSpace(req.App))
+        if (!AppTokenStore.TryNormalizeAppName(req.App, out var app, out var error))
         {
-            return BadRequest("app is required");
+            return BadRequest(error);
         }
-        var plaintext = await store.CreateOrRotateAsync(req.App.Trim());
-        return Ok(new CreateAppTokenResponse(req.App.Trim(), plaintext));
+        var plaintext = await store.CreateOrRotateAsync(app);
+        return Ok(new CreateAppTokenResponse(app, plaintext));
     }
 
     [HttpDelete("{app}")]
