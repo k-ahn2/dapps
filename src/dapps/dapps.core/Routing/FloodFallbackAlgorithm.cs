@@ -5,11 +5,20 @@ namespace dapps.core.Routing;
 
 /// <summary>
 /// Bounded-flood fallback for cold-start routing - the second half
-/// of B5. When the inner algorithm has no route and the message
-/// hasn't yet been flooded, send to every direct neighbour with a
-/// hop budget. Each forwarding hop decrements before re-flooding;
-/// per-(message, link-source) deduplication via <see cref="DbFloodSeen"/>
-/// stops the flood from looping back.
+/// of B5. When the inner algorithm has no route for a message a local
+/// app submitted here, send it to every direct neighbour with a hop
+/// budget. Only the originator floods (#295): a message that arrived
+/// from a neighbour and has no route waits in the queue for one, and
+/// expires by its ttl as any other does. Session bearers (AGW, RHP)
+/// don't carry the hop budget, so a relay re-flooding what it got
+/// would start a fresh, full flood at every node, back to where the
+/// message came from.
+///
+/// Datagram bearers (UDP, MeshCore) do carry the budget. A message that
+/// arrived on one with its budget still set carries on as a flood: each
+/// forwarding hop decrements before re-flooding, and per-(message,
+/// link-source) deduplication via <see cref="DbFloodSeen"/> stops the
+/// flood from looping back.
 ///
 /// Layered as a decorator over the next inner algorithm (typically
 /// <see cref="PassiveLearningAlgorithm"/>): if the inner algorithm
@@ -70,6 +79,14 @@ public sealed class FloodFallbackAlgorithm(
         if (innerDecision is not RouteDecision.Unreachable)
         {
             return innerDecision;
+        }
+
+        if (!SplitHorizon.OriginatedHere(message, ctx.LocalCallsign))
+        {
+            // Not ours to flood: it waits for a route (#295). The
+            // forwarder says so, once per message.
+            logger.LogDebug("No route for {0} (from {1}); not ours to flood, leaving it queued", message.Id, message.SourceCallsign);
+            return new RouteDecision.Unreachable();
         }
 
         var floodRoutes = await BuildFloodRoutesAsync(ctx, [], ct);

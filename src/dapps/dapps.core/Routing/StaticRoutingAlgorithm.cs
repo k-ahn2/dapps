@@ -27,9 +27,20 @@ namespace dapps.core.Routing;
 /// </summary>
 public sealed class StaticRoutingAlgorithm(ILogger<StaticRoutingAlgorithm> logger) : IRoutingAlgorithm
 {
-    public async Task<RouteDecision> ResolveAsync(DbMessage message, IRoutingContext ctx, CancellationToken ct)
+    public Task<RouteDecision> ResolveAsync(DbMessage message, IRoutingContext ctx, CancellationToken ct)
+        => ResolveAsync(message, ctx, cameFrom: null, ct);
+
+    /// <summary>
+    /// As <see cref="ResolveAsync(DbMessage, IRoutingContext, CancellationToken)"/>,
+    /// passing over the neighbour a message passing through came from,
+    /// <paramref name="cameFrom"/> (see <see cref="SplitHorizon.Avoids"/>),
+    /// on every tier, so a lower tier gets its turn (#297).
+    /// </summary>
+    internal async Task<RouteDecision> ResolveAsync(DbMessage message, IRoutingContext ctx, string? cameFrom, CancellationToken ct)
     {
-        var neighbours = await ctx.GetNeighboursAsync(ct);
+        var allNeighbours = await ctx.GetNeighboursAsync(ct);
+        var Avoided = SplitHorizon.Avoids(cameFrom, allNeighbours);
+        var neighbours = allNeighbours.Where(n => !Avoided(n.Callsign)).ToList();
         var peers = await ctx.GetDiscoveredPeersAsync(ct);
 
         // Destinations are `app@call[-ssid]`. A neighbour with the exact
@@ -53,6 +64,7 @@ public sealed class StaticRoutingAlgorithm(ILogger<StaticRoutingAlgorithm> logge
             .Where(p => DestinationParser.SameStation(p.Callsign, destCall)
                 || CallsignMatch.StandsIn(p.Callsign, destCall, ctx.LocalCallsign))
             .Where(p => (now - p.LastSeen).TotalSeconds <= p.TtlSeconds)
+            .Where(p => !Avoided(p.Callsign))
             .OrderBy(p => DestinationParser.SameStation(p.Callsign, destCall) ? 0 : 1)
             .ThenBy(p => p.CostHint)
             .ThenBy(p => p.Hops)
@@ -78,7 +90,7 @@ public sealed class StaticRoutingAlgorithm(ILogger<StaticRoutingAlgorithm> logge
         //    A hint for the exact call+SSID beats one written without an
         //    SSID, which covers every SSID of its callsign.
         var hintNeighbour = await ctx.ResolveRouteHintAsync(destCall, ct);
-        if (hintNeighbour is not null)
+        if (hintNeighbour is not null && !Avoided(hintNeighbour.Callsign))
         {
             logger.LogInformation("Routing {0} for {1} via route-hint next-hop {2}",
                 message.Id, message.Destination, hintNeighbour.Callsign);

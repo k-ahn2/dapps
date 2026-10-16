@@ -72,15 +72,24 @@ Selected via `DAPPS_ROUTING_ALGORITHM` (restart required).
 
 AODV-flavoured. Routes are learned from observed forwards: when a message is forwarded *through* this node, the source becomes a known reach, the next hop becomes the way to reach the destination. The learned-routes table builds up over time without any extra airtime.
 
-Looks at the message destination, walks: neighbour -> fresh discovered peer -> route hint -> learned route. First match wins. If nothing matches, it falls back to a bounded flood: the message goes to every neighbour with a small hop limit, and the replies teach the routes.
+Looks at the message destination, walks: neighbour -> fresh discovered peer -> route hint -> learned route. First match wins. A message passing through never goes back to the neighbour it came from, whichever of these suggests it.
+
+If nothing matches, what happens depends on where the message started:
+
+- **Sent from this node:** it floods. The message goes once to every neighbour, and the replies teach the routes.
+- **Passing through:** it waits in the queue. Each forwarder run tries again, so it goes as soon as a route turns up, and it expires by its ttl like any other message. Only the node a message started at floods it.
+
+On UDP and MeshCore links the flood carries a hop limit, and a node that receives a flood still holding hops passes it on to its other neighbours. AGW and RHP sessions carry no hop count, so a node that gets a flooded message over one treats it like any other message passing through.
 
 Learned routes are kept per station, SSID included: a route to `G6FCI-7` says nothing about `G6FCI-8`, and two nodes under one callsign learn routes to each other like any other pair.
 
-Works well on small meshes. The trade-off is no proactive route discovery - until traffic has taught a route, mail to a far station goes out as a flood.
+Works well on small meshes. The trade-off is no proactive route discovery. Until traffic, gossip or a hint has given a route, mail to a far station goes out as a flood from the sender, and over AGW or RHP that flood reaches only the sender's neighbours: one with no route of its own keeps the message until a route turns up. Add a route hint if you need mail to get further sooner.
 
 ### `meshcore`
 
 DSR-flavoured. The sender stamps the path on the message; intermediate nodes follow it. Adds a few bytes per message; works better when the topology is volatile, when you want explicit per-message path control, or when you're emulating MeshCore-on-AX.25 for testing.
+
+The rules above about only the sender flooding and never sending a message back where it came from belong to `passive-flood`. The `meshcore` stack doesn't follow them yet: a relay with no path still starts a fresh flood of its own (tracked in #295 and #296).
 
 ## Route gossip
 
