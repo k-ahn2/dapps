@@ -67,6 +67,11 @@ public class OutboundMessageManager(
     /// </summary>
     private readonly ConcurrentDictionary<string, DateTime> handedToSession = new(StringComparer.Ordinal);
 
+    /// <summary>When a message that the forwarder could not handle was
+    /// last logged as an error. A row that keeps failing is logged once
+    /// an hour, not on every run.</summary>
+    private readonly ConcurrentDictionary<string, DateTime> failureLoggedAt = new(StringComparer.Ordinal);
+
     /// <summary>How long a hand-off holds a message back from later runs,
     /// in case the session never gets to it.</summary>
     internal TimeSpan HandOffPatience { get; set; } = TimeSpan.FromMinutes(10);
@@ -133,6 +138,7 @@ public class OutboundMessageManager(
         var queuedKeys = messages.Select(RefusalKey).ToHashSet(StringComparer.Ordinal);
         foreach (var key in refusals.Keys.Where(k => !queuedKeys.Contains(k)).ToList()) refusals.TryRemove(key, out _);
         foreach (var id in handedToSession.Keys.Where(id => !seen.Contains(id)).ToList()) handedToSession.TryRemove(id, out _);
+        foreach (var id in failureLoggedAt.Keys.Where(id => !seen.Contains(id)).ToList()) failureLoggedAt.TryRemove(id, out _);
 
         // Messages for the same next hop go out together on one session
         // rather than one session each. The work runs in queue order: a
@@ -144,83 +150,102 @@ public class OutboundMessageManager(
 
         foreach (var message in messages)
         {
-            // Already going out on a session, or waiting in one's queue.
-            if (inFlight.ContainsKey(message.Id)) continue;
-            if (handedToSession.TryGetValue(message.Id, out var handedAt))
+            // One bad row must not stop the run: an exception here would
+            // leave every batch below unsent, on this run and every later
+            // one while the row stays queued (#284).
+            try
             {
-                if (DateTime.UtcNow - handedAt < HandOffPatience) continue;
-                handedToSession.TryRemove(message.Id, out _);
+                // Already going out on a session, or waiting in one's queue.
+                if (inFlight.ContainsKey(message.Id)) continue;
+                if (handedToSession.TryGetValue(message.Id, out var handedAt))
+                {
+                    if (DateTime.UtcNow - handedAt < HandOffPatience) continue;
+                    handedToSession.TryRemove(message.Id, out _);
+                }
+
+                var residualTtl = TtlMath.Residual(message.Ttl, message.CreatedAt, DateTime.UtcNow);
+                if (residualTtl is <= 0)
+                {
+                    logger.LogWarning("Dropping message {0} for {1}: ttl expired ({2}s queued, original ttl={3}s)",
+                        message.Id, message.Destination,
+                        (int)(DateTime.UtcNow - message.CreatedAt).TotalSeconds, message.Ttl);
+                    metrics.RecordTtlExpired(message.Id, message.Destination);
+                    await database.SoftDeleteMessage(message.Id, "ttl-expired");
+                    refusals.TryRemove(RefusalKey(message), out _);
+                    continue;
+                }
+
+                var decision = await routingAlgorithm.ResolveAsync(message, routingContext, stoppingToken);
+
+                if (refusals.TryGetValue(RefusalKey(message), out var refusedBy)
+                    && !(decision is RouteDecision.NextHop other && !refusedBy.ContainsKey(other.Route.Callsign)))
+                {
+                    // Refused by its next hop, and there's no other way to send it.
+                    var reason = string.Join("; ", refusedBy.Values);
+                    logger.LogWarning("Dropping message {0} for {1}: no route left that will take it ({2})",
+                        message.Id, message.Destination, reason);
+                    await database.SoftDeleteMessage(message.Id, "refused: " + reason);
+                    refusals.TryRemove(RefusalKey(message), out _);
+                    continue;
+                }
+
+                switch (decision)
+                {
+                    case RouteDecision.NextHop nh:
+                        if (!batches.TryGetValue(nh.Route, out var batch))
+                        {
+                            batch = new NextHopBatch(this, nh.Route, runStartedAt, seen);
+                            batches.Add(nh.Route, batch);
+                            work.Add(batch);
+                        }
+                        batch.Add(message, nh.SourceRoute);
+                        break;
+
+                    case RouteDecision.FloodToNeighbours flood:
+                        work.Add(new PendingFlood(message, flood));
+                        break;
+
+                    case RouteDecision.Unreachable when openSessions?.CallerFor(message.Destination, options.CurrentValue.Callsign) is { } caller:
+                        // No route, but the node it's for has a session open
+                        // with us: it goes on that session (what `rev` used to
+                        // collect), and nowhere else. We have no route to dial.
+                        if (!callerBatches.TryGetValue(caller, out var callerBatch))
+                        {
+                            callerBatch = new NextHopBatch(this, new BackhaulRoute(caller), runStartedAt, seen) { HandOffOnly = true };
+                            callerBatches.Add(caller, callerBatch);
+                            work.Add(callerBatch);
+                        }
+                        callerBatch.Add(message, null);
+                        break;
+
+                    case RouteDecision.Unreachable:
+                        logger.LogWarning("No route for {0}, leaving in queue", message.Id);
+                        metrics.RecordNoRoute(message.Id, message.Destination);
+                        break;
+
+                    default:
+                        // Future RouteDecision cases (SourceRoute, BearerDelegated)
+                        // will land here when those algorithms ship; today they
+                        // don't appear, so a defensive log keeps a regression
+                        // visible rather than silently no-op'ing.
+                        logger.LogError("Unsupported RouteDecision {0} for {1}; treating as Unreachable",
+                            decision.GetType().Name, message.Id);
+                        metrics.RecordNoRoute(message.Id, message.Destination);
+                        break;
+                }
             }
-
-            var residualTtl = TtlMath.Residual(message.Ttl, message.CreatedAt, DateTime.UtcNow);
-            if (residualTtl is <= 0)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                logger.LogWarning("Dropping message {0} for {1}: ttl expired ({2}s queued, original ttl={3}s)",
-                    message.Id, message.Destination,
-                    (int)(DateTime.UtcNow - message.CreatedAt).TotalSeconds, message.Ttl);
-                metrics.RecordTtlExpired(message.Id, message.Destination);
-                await database.SoftDeleteMessage(message.Id, "ttl-expired");
-                refusals.TryRemove(RefusalKey(message), out _);
-                continue;
-            }
-
-            var decision = await routingAlgorithm.ResolveAsync(message, routingContext, stoppingToken);
-
-            if (refusals.TryGetValue(RefusalKey(message), out var refusedBy)
-                && !(decision is RouteDecision.NextHop other && !refusedBy.ContainsKey(other.Route.Callsign)))
-            {
-                // Refused by its next hop, and there's no other way to send it.
-                var reason = string.Join("; ", refusedBy.Values);
-                logger.LogWarning("Dropping message {0} for {1}: no route left that will take it ({2})",
-                    message.Id, message.Destination, reason);
-                await database.SoftDeleteMessage(message.Id, "refused: " + reason);
-                refusals.TryRemove(RefusalKey(message), out _);
-                continue;
-            }
-
-            switch (decision)
-            {
-                case RouteDecision.NextHop nh:
-                    if (!batches.TryGetValue(nh.Route, out var batch))
-                    {
-                        batch = new NextHopBatch(this, nh.Route, runStartedAt, seen);
-                        batches.Add(nh.Route, batch);
-                        work.Add(batch);
-                    }
-                    batch.Add(message, nh.SourceRoute);
-                    break;
-
-                case RouteDecision.FloodToNeighbours flood:
-                    work.Add(new PendingFlood(message, flood));
-                    break;
-
-                case RouteDecision.Unreachable when openSessions?.CallerFor(message.Destination, options.CurrentValue.Callsign) is { } caller:
-                    // No route, but the node it's for has a session open
-                    // with us: it goes on that session (what `rev` used to
-                    // collect), and nowhere else. We have no route to dial.
-                    if (!callerBatches.TryGetValue(caller, out var callerBatch))
-                    {
-                        callerBatch = new NextHopBatch(this, new BackhaulRoute(caller), runStartedAt, seen) { HandOffOnly = true };
-                        callerBatches.Add(caller, callerBatch);
-                        work.Add(callerBatch);
-                    }
-                    callerBatch.Add(message, null);
-                    break;
-
-                case RouteDecision.Unreachable:
-                    logger.LogWarning("No route for {0}, leaving in queue", message.Id);
-                    metrics.RecordNoRoute(message.Id, message.Destination);
-                    break;
-
-                default:
-                    // Future RouteDecision cases (SourceRoute, BearerDelegated)
-                    // will land here when those algorithms ship; today they
-                    // don't appear, so a defensive log keeps a regression
-                    // visible rather than silently no-op'ing.
-                    logger.LogError("Unsupported RouteDecision {0} for {1}; treating as Unreachable",
-                        decision.GetType().Name, message.Id);
-                    metrics.RecordNoRoute(message.Id, message.Destination);
-                    break;
+                var now = DateTime.UtcNow;
+                if (!failureLoggedAt.TryGetValue(message.Id, out var loggedAt) || now - loggedAt >= TimeSpan.FromHours(1))
+                {
+                    failureLoggedAt[message.Id] = now;
+                    logger.LogError(ex, "Forwarder: could not handle message {0}, leaving it and carrying on with the rest", message.Id);
+                }
+                else
+                {
+                    logger.LogDebug(ex, "Forwarder: could not handle message {0} again", message.Id);
+                }
             }
         }
 

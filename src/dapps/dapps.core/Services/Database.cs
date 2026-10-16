@@ -247,13 +247,36 @@ public class Database(
     /// have been concurrently dropped). Used by the forwarder and TTL
     /// sweeper instead of <see cref="DeleteMessage"/> when discarding
     /// rather than acknowledging.
+    ///
+    /// Ids are only 28 bits and <c>dropped_messages</c> is never purged,
+    /// so an id can already be there from an earlier drop, of this
+    /// message or an unrelated one: the newer drop replaces that record
+    /// rather than failing (#284). The same goes for a row left in both
+    /// tables by a crash between the two steps: the next drop of it
+    /// replaces the copy and finishes the job.
     /// </summary>
-    internal async Task SoftDeleteMessage(string id, string reason)
+    internal Task SoftDeleteMessage(string id, string reason) => DropAsync(id, reason, onlyIfStillQueued: false);
+
+    /// <summary>
+    /// Drop one message. With <paramref name="onlyIfStillQueued"/>, a row
+    /// already forwarded or delivered to its app by the time it is read
+    /// here is simply deleted, not recorded as a drop (#285).
+    /// </summary>
+    private async Task DropAsync(string id, string reason, bool onlyIfStillQueued)
     {
+        // The shared pooled connection on purpose: it serialises every
+        // statement in the process, so these can never meet a locked
+        // database. No transaction for the same reason (with the pool's
+        // lock skipped, other callers' statements would land inside it).
         var c = DbInfo.GetAsyncConnection();
         var row = await c.FindAsync<DbMessage>(id);
         if (row is null) return;
-        await c.InsertAsync(new DbDroppedMessage
+        if (onlyIfStillQueued && (row.Forwarded || row.LocallyDelivered))
+        {
+            await c.DeleteAsync<DbMessage>(id);
+            return;
+        }
+        await c.InsertOrReplaceAsync(new DbDroppedMessage
         {
             Id = row.Id,
             Payload = row.Payload,
@@ -291,7 +314,9 @@ public class Database(
         => await DbInfo.GetAsyncConnection().FindAsync<DbDroppedMessage>(id);
 
     /// <summary>
-    /// Soft-delete every message whose TTL has elapsed. Returns how many.
+    /// Remove every message whose TTL has elapsed. Ones still queued are
+    /// soft-deleted as <c>ttl-expired</c>; ones already forwarded or
+    /// delivered locally are simply deleted. Returns how many went.
     /// </summary>
     internal async Task<int> DeleteExpired(DateTime now)
     {
@@ -304,12 +329,28 @@ public class Database(
                 "select * from messages where Ttl is not null"))
             .Where(m => TtlMath.HasExpired(m.Ttl, m.CreatedAt, now))
             .ToList();
+        var actioned = 0;
         foreach (var message in expiredMessages)
         {
-            await SoftDeleteMessage(message.Id, "ttl-expired");
+            // One bad row must not stop the sweep for every row after it,
+            // on this sweep and every later one (#284).
+            try
+            {
+                // Already sent on or delivered to its app (checked again
+                // as it is dropped, in case that happened since the rows
+                // were read): it did not expire, its job is done. It goes
+                // without a ttl-expired record, which would tell the
+                // operator it never went (#285).
+                await DropAsync(message.Id, "ttl-expired", onlyIfStillQueued: true);
+                actioned++;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "TTL sweep: could not remove expired message {0}, carrying on with the rest", message.Id);
+            }
         }
 
-        return expiredMessages.Count;
+        return actioned;
     }
 
     internal async Task<ICollection<DbNeighbour>> GetNeighbours()
