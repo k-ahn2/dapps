@@ -83,6 +83,14 @@ public sealed class ExchangeSession
 
     private readonly List<DappsProtocolClient.GossipedRoute> gossiped = [];
 
+    /// <summary>Pings asked for from outside, waiting for the loop to send them.</summary>
+    private readonly Channel<Ping> pings = Channel.CreateUnbounded<Ping>();
+
+    /// <summary>Our pings on the wire, by token, waiting for their <c>pong</c>.</summary>
+    private readonly Dictionary<string, Ping> pingsOut = new(StringComparer.Ordinal);
+
+    private volatile SessionStatus? status;
+
     private IBackhaulBatch? current;
     private bool ownSent;
     private bool promptSeen;
@@ -247,6 +255,42 @@ public sealed class ExchangeSession
     public bool TryTake(IBackhaulBatch batch) => work.Writer.TryWrite(batch);
 
     /// <summary>
+    /// Where the session stands, as of the last turn of its loop: safe to
+    /// read from any thread.
+    /// </summary>
+    public SessionStatus Status => status ?? NotStarted;
+
+    private SessionStatus NotStarted => new(peer, dialled, default, default, false, false, 0, null, 0);
+
+    /// <summary>
+    /// Sends <c>ping</c> down this session and waits for the peer's
+    /// <c>pong</c>, up to <paramref name="timeout"/>. The outcome says
+    /// whether the ping went at all (not before the exchange, nor once the
+    /// session is ending) and the round trip if the pong came. For a probe, when a session with the peer is already
+    /// open and dialling it again would reset the link. It doesn't count
+    /// as progress: a session stuck with ours unanswered still ends on
+    /// time, however many pings the peer answers. A peer on a version
+    /// without <c>ping</c> ignores it, as it does any word it doesn't know.
+    /// </summary>
+    public async Task<PingOutcome> PingAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        var ping = new Ping();
+        if (!pings.Writer.TryWrite(ping)) return new PingOutcome(Sent: false, RoundTrip: null);
+        try
+        {
+            return await ping.Answered.Task.WaitAsync(timeout, TimeProvider, ct);
+        }
+        catch (TimeoutException)
+        {
+            return new PingOutcome(Sent: true, RoundTrip: null);
+        }
+        finally
+        {
+            ping.Answered.TrySetResult(new PingOutcome(Sent: true, RoundTrip: null));
+        }
+    }
+
+    /// <summary>
     /// Run the session until it ends: the caller's <c>quit</c> after a
     /// quiet spell, the peer hanging up, or the link going.
     /// </summary>
@@ -268,6 +312,10 @@ public sealed class ExchangeSession
 
             while (true)
             {
+                // The status first: a ping refused below must find it
+                // already saying the session is ending.
+                status = TakeStatus();
+                SendPings();
                 if (!done) await FillWindowAsync(ct);
                 await FlushAsync(ct);
                 if (done) break;
@@ -292,6 +340,9 @@ public sealed class ExchangeSession
         finally
         {
             End();
+            status = TakeStatus();
+            foreach (var ping in pingsOut.Values) ping.Answered.TrySetResult(new PingOutcome(Sent: true, RoundTrip: null));
+            while (pings.Reader.TryRead(out var ping)) ping.Answered.TrySetResult(new PingOutcome(Sent: false, RoundTrip: null));
             await SettleUnfinishedAsync(ct.IsCancellationRequested);
             if (ownsLink) link.Dispose();
         }
@@ -302,7 +353,40 @@ public sealed class ExchangeSession
     {
         done = true;
         work.Writer.TryComplete();
+        pings.Writer.TryComplete();
     }
+
+    /// <summary>
+    /// Sends the pings asked for since the last turn. Only in an
+    /// established session that isn't ending: before the exchange the
+    /// answering node takes a line it doesn't know as a mistyped command
+    /// and hangs up.
+    /// </summary>
+    private void SendPings()
+    {
+        while (pings.Reader.TryRead(out var ping))
+        {
+            if (!Established || quitting || done)
+            {
+                ping.Answered.TrySetResult(new PingOutcome(Sent: false, RoundTrip: null));
+                continue;
+            }
+            ping.SentAt = Now;
+            pingsOut[ping.Token] = ping;
+            Queue($"ping {ping.Token}\n");
+        }
+    }
+
+    private SessionStatus TakeStatus() => new(
+        Peer: peer,
+        Dialled: dialled,
+        Started: started,
+        LastHeard: lastHeard,
+        Established: Established,
+        Ending: quitting || done,
+        Unanswered: unanswered.Count,
+        OldestUnansweredSentAt: unanswered.Count > 0 ? unanswered.Min(o => o.SentAt) : null,
+        Receiving: accepted.Count);
 
     /// <summary>
     /// What's still ours when the session ends. Unanswered messages go
@@ -525,6 +609,7 @@ public sealed class ExchangeSession
             data = link.WaitForDataAsync(waiting.Token).AsTask();
             var waits = new List<Task> { data, Task.Delay(delay, TimeProvider, waiting.Token) };
             if (CanSend) waits.Add(work.Reader.WaitToReadAsync(waiting.Token).AsTask());
+            waits.Add(pings.Reader.WaitToReadAsync(waiting.Token).AsTask());
             if (dialled && !ownSent && !awaitingRoutes && CrossedCall is { IsCompleted: false } crossed) waits.Add(crossed);
             await Task.WhenAny(waits);
             await waiting.CancelAsync();
@@ -614,6 +699,15 @@ public sealed class ExchangeSession
             case "data":
                 if (await ReceiveDataAsync(line, ct)) HeardExchangeTraffic();
                 lastProgress = Now;
+                return;
+            case "ping" when Established && IsWord(id):
+                // Answered at once, in the same write as anything else this
+                // turn: the peer is timing the link, not our queue.
+                Queue($"pong {id}\n");
+                return;
+            case "pong" when Established && IsWord(id):
+                if (pingsOut.Remove(id!, out var ping)) ping.Answered.TrySetResult(new PingOutcome(Sent: true, RoundTrip: Now - ping.SentAt));
+                else logger.LogInformation("A pong from {0} for no ping of ours: '{1}'", peer, Printable(line));
                 return;
         }
 
@@ -1315,4 +1409,34 @@ public sealed class ExchangeSession
         public byte[] Wire { get; set; } = [];
         public bool Retried { get; set; }
     }
+
+    private sealed class Ping
+    {
+        public string Token { get; } = Convert.ToHexStringLower(BitConverter.GetBytes(Random.Shared.Next()));
+        public DateTimeOffset SentAt { get; set; }
+        public TaskCompletionSource<PingOutcome> Answered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 }
+
+/// <summary>
+/// How a <see cref="ExchangeSession.PingAsync"/> went: whether the ping
+/// went on the wire, and the round trip when its <c>pong</c> came back.
+/// </summary>
+public sealed record PingOutcome(bool Sent, TimeSpan? RoundTrip);
+
+/// <summary>
+/// Where an <see cref="ExchangeSession"/> stands: who dialled, how long
+/// it has been up, when the peer last sent anything, and what is waiting
+/// on an answer either way. <see cref="Receiving"/> counts the peer's
+/// offers we asked for whose payloads haven't come yet.
+/// </summary>
+public sealed record SessionStatus(
+    string Peer,
+    bool Dialled,
+    DateTimeOffset Started,
+    DateTimeOffset LastHeard,
+    bool Established,
+    bool Ending,
+    int Unanswered,
+    DateTimeOffset? OldestUnansweredSentAt,
+    int Receiving);
