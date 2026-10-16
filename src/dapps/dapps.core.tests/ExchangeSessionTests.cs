@@ -1187,6 +1187,154 @@ public sealed class ExchangeSessionTests : IDisposable
         session.Established.Should().BeTrue("it ended because nothing after that line can be read in step");
     }
 
+    // ---- The 16 MB cap (#262) ----
+
+    /// <summary>Allocated anywhere in the process while it ran: well
+    /// clear of what other tests running alongside allocate, and far
+    /// under the 2 GB a believed len used to cost.</summary>
+    private const long Modest = 256L * 1024 * 1024;
+
+    private const int Huge = 2_000_000_000;
+
+    private static string Over(string verb, string id, string format, int length, int? clen) =>
+        OfferLine.Build(verb, id, 1L, format, clen, $"app@{Us}", length);
+
+    [Theory]
+    [InlineData("p", Huge, null)]
+    [InlineData("z1", Huge, 40)]
+    [InlineData("d", 100, Huge)]
+    [InlineData("p", PayloadCompression.MaxPayloadBytes + 1, null)]
+    public async Task AnOfferOverTheCap_IsAnsweredTooLarge_WithoutAllocatingIt(string format, int length, int? clen)
+    {
+        var (_, peer, _) = await CalleeAsync();
+        await peer.WriteLineAsync(Rules(), Ct);
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+
+        await peer.WriteAsync(Encoding.UTF8.GetBytes(Over("ihave", "abc1234", format, length, clen)), Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be("no abc1234 too large");
+        (GC.GetTotalAllocatedBytes(precise: true) - before).Should().BeLessThan(Modest);
+    }
+
+    [Fact]
+    public async Task AnOfferRightAtTheCap_IsAccepted()
+    {
+        var (_, peer, _) = await CalleeAsync();
+        await peer.WriteLineAsync(Rules(), Ct);
+
+        await peer.WriteAsync(Encoding.UTF8.GetBytes(Over("ihave", "abc1234", "p", PayloadCompression.MaxPayloadBytes, null)), Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be("send abc1234");
+    }
+
+    [Fact]
+    public async Task ADeflatedMessageSaidToInflateOverTheCap_IsAnsweredTooLarge_WithoutAllocatingIt()
+    {
+        // clen=4 passed the old check, which only looked at the bytes on
+        // the wire; the inflater then allocated len+1. Its four bytes are
+        // read past, so the session stays in step.
+        var inbox = new RecordingInbox();
+        var (session, peer, _) = await CalleeAsync(inbox: inbox);
+        await peer.WriteLineAsync(Rules(), Ct);
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+
+        await peer.WriteAsync([.. Encoding.UTF8.GetBytes(Over("msg", "abc1234", "d", Huge, 4)), 1, 2, 3, 4], Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be("no abc1234 too large");
+        (GC.GetTotalAllocatedBytes(precise: true) - before).Should().BeLessThan(Modest);
+        await AMessageStillGetsThroughAsync(peer, inbox);
+    }
+
+    [Fact]
+    public async Task AZstdMessageWhoseFrameClaimsOverTheCap_IsAnsweredTooLarge_WithoutAllocatingIt()
+    {
+        // Unwrap allocates what the frame header says, up to len: with len
+        // believed too, that was 2 GB.
+        var frame = PayloadCompression.TryCompress(Encoding.UTF8.GetBytes(WpsPost))!.Value.Bytes;
+        var lying = WithClaimedContentSize(frame, Huge);
+        var inbox = new RecordingInbox();
+        var (session, peer, _) = await CalleeAsync(inbox: inbox);
+        await peer.WriteLineAsync(Rules(), Ct);
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+
+        await peer.WriteAsync([.. Encoding.UTF8.GetBytes(Over("msg", "abc1234", "z1", Huge, lying.Length)), .. lying], Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be("no abc1234 too large");
+        (GC.GetTotalAllocatedBytes(precise: true) - before).Should().BeLessThan(Modest);
+        await AMessageStillGetsThroughAsync(peer, inbox);
+    }
+
+    private async Task AMessageStillGetsThroughAsync(LinePeer peer, RecordingInbox inbox)
+    {
+        var next = Message("still in step", $"app@{Us}", 9);
+        await peer.SendMessageAsync(next, Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be($"ack {next.Id}");
+        inbox.Texts.Should().Equal("still in step");
+    }
+
+    [Theory]
+    [InlineData("p", Huge, null)]
+    [InlineData("d", 100, Huge)]
+    [InlineData("z1", Huge, Huge)]
+    public async Task AMessageWhoseBytesOnTheWireAreOverTheCap_EndsTheSession_WithoutAllocatingThem(string format, int length, int? clen)
+    {
+        var (session, peer, run) = await CalleeAsync();
+        await peer.WriteLineAsync(Rules(), Ct);
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+
+        await peer.WriteAsync(Encoding.UTF8.GetBytes(Over("msg", "abc1234", format, length, clen)), Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be("quit");
+        await run.WaitAsync(Patience, Ct);
+        (GC.GetTotalAllocatedBytes(precise: true) - before).Should().BeLessThan(Modest);
+        session.Delivered.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData("d", Huge, 4, true)]
+    [InlineData("p", Huge, null, false)]
+    [InlineData("d", 100, Huge, false)]
+    public async Task AMessageOverTheCapArrivingAfterOurQuit_IsNotAllocated(string format, int length, int? clen, bool readPast)
+    {
+        var m = Message("in flight", $"app@{Them}");
+        var batch = new RecordingBatch(m);
+        var (session, peer, run, _) = await CallerAsync(maxLength: TimeSpan.FromSeconds(1));
+        session.TryTake(batch);
+        await peer.WriteAsync(Encoding.UTF8.GetBytes("DAPPSv1>\n" + Rules() + "\n"), Ct);
+        await peer.ReadLineAsync(Ct);
+        await peer.ReadWithPayloadAsync(Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be("quit");
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+
+        var line = Encoding.UTF8.GetBytes(Over("msg", "abc1234", format, length, clen));
+        await peer.WriteAsync(readPast ? [.. line, 1, 2, 3, 4] : line, Ct);
+        if (readPast) await peer.WriteLineAsync($"ack {m.Id}\nbye", Ct);
+        await run.WaitAsync(Patience, Ct);
+
+        (GC.GetTotalAllocatedBytes(precise: true) - before).Should().BeLessThan(Modest);
+        if (readPast)
+        {
+            batch.Outcomes.Single().Result.Accepted.Should().BeTrue("its four bytes were read past, so the ack after them was read in step");
+        }
+    }
+
+    [Fact]
+    public async Task ADeflatedMessageRightAtTheCap_IsDelivered()
+    {
+        var payload = new byte[PayloadCompression.MaxPayloadBytes];
+        payload[^1] = 7;
+        var m = new BackhaulMessage(DappsMessage.ComputeHash(payload, 1L)[..7], $"app@{Us}", 1L, 600, payload);
+        var wire = Deflate(payload);
+        var inbox = new RecordingInbox();
+        var (_, peer, _) = await CalleeAsync(inbox: inbox);
+        await peer.WriteLineAsync(Rules(), Ct);
+
+        await peer.WriteAsync([.. Encoding.UTF8.GetBytes(OfferLine.Build("msg", m, "d", wire.Length)), .. wire], Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().Be($"ack {m.Id}");
+        inbox.Messages.Single().Payload.Should().Equal(payload);
+    }
+
     [Fact]
     public async Task ALineCutOffByTheLinkGoing_IsTheLinkGoing_NotAGarbledLine()
     {

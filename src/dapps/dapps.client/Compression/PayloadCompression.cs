@@ -39,6 +39,14 @@ public static class PayloadCompression
     /// </summary>
     public const int MinimumSaving = 32;
 
+    /// <summary>
+    /// The largest payload a session takes, both as sent (<c>clen=</c>)
+    /// and once decoded (<c>len=</c>). Anything said to be bigger can't
+    /// be meant, and believing it would have the node allocate whatever
+    /// a peer claims (docs/implement.md).
+    /// </summary>
+    public const int MaxPayloadBytes = 16 * 1024 * 1024;
+
     private const int Level = 19;
 
     private static readonly IReadOnlyDictionary<int, byte[]> Dictionaries = new Dictionary<int, byte[]>
@@ -85,11 +93,12 @@ public static class PayloadCompression
     /// the original payload; decoding never produces more than that.
     /// Throws <see cref="InvalidDataException"/> for an unknown format,
     /// corrupt data, or a result that isn't exactly <paramref name="length"/>
-    /// bytes.
+    /// bytes. Nothing is allocated on the strength of <paramref name="length"/>
+    /// alone, and a length over <see cref="MaxPayloadBytes"/> is refused.
     /// </summary>
     public static byte[] Decode(string format, byte[] wire, int length)
     {
-        if (length < 0 || length >= Array.MaxLength)
+        if (length < 0 || length > MaxPayloadBytes)
         {
             throw new InvalidDataException($"len={length} is out of range");
         }
@@ -109,6 +118,15 @@ public static class PayloadCompression
             {
                 using var decompressor = new ZstdSharp.Decompressor();
                 decompressor.LoadDictionary(dictionary);
+                // Unwrap allocates what the frame header says the content
+                // is, up to the cap given. Check the header against len
+                // first, so a frame that claims more than it was offered as
+                // is refused before anything is allocated for it.
+                var declared = ZstdSharp.Decompressor.GetDecompressedSize(wire);
+                if (declared != (ulong)length)
+                {
+                    throw new InvalidDataException($"fmt={format} frame says it holds {declared} bytes, len= said {length}");
+                }
                 decoded = decompressor.Unwrap(wire, maxDecompressedSize: length).ToArray();
             }
             catch (ZstdSharp.ZstdException ex)
@@ -149,23 +167,36 @@ public static class PayloadCompression
     {
         using var input = new MemoryStream(wire);
         using var inflater = new DeflateStream(input, CompressionMode.Decompress);
-        // One byte of headroom so an over-long result is caught as a
-        // length mismatch rather than silently truncated.
-        var buffer = new byte[length + 1];
-        var total = 0;
+        // Grows with what actually inflates, never on the word of len:
+        // a few bytes that claim to inflate to 2 GB cost a few bytes. The
+        // buffer never grows past len, so a payload right at the cap costs
+        // what it is, not double.
+        using var output = new MemoryStream(Math.Min(length, Math.Max(4096, wire.Length * 4)));
+        var chunk = new byte[Math.Min(Math.Max(length, 1), 64 * 1024)];
         try
         {
             int n;
-            while (total < buffer.Length && (n = inflater.Read(buffer, total, buffer.Length - total)) > 0)
+            while (output.Length < length
+                && (n = inflater.Read(chunk, 0, (int)Math.Min(chunk.Length, length - output.Length))) > 0)
             {
-                total += n;
+                if (output.Length + n > output.Capacity)
+                {
+                    output.Capacity = (int)Math.Min(length, Math.Max(output.Length + n, (long)output.Capacity * 2));
+                }
+                output.Write(chunk, 0, n);
+            }
+            // Anything past len is caught as a length mismatch rather than
+            // silently truncated.
+            if (output.Length == length && inflater.Read(chunk, 0, 1) > 0)
+            {
+                throw new InvalidDataException($"fmt=d payload decoded to more than {length} bytes, len= said {length}");
             }
         }
         catch (Exception ex) when (ex is not InvalidDataException)
         {
             throw new InvalidDataException($"fmt=d payload does not decode: {ex.Message}", ex);
         }
-        return buffer[..total];
+        return output.Length == output.Capacity ? output.GetBuffer() : output.ToArray();
     }
 
     private static byte[] LoadDictionary(string name)

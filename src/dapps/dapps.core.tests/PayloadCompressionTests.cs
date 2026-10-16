@@ -50,6 +50,109 @@ public sealed class PayloadCompressionTests
         act.Should().Throw<InvalidDataException>();
     }
 
+    // ---- The 16 MB cap (#262): nothing allocated on the word of len ----
+
+    private const long FewMegabytes = 4 * 1024 * 1024;
+
+    private static long AllocatedBy(Action act)
+    {
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        act();
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    [Theory]
+    [InlineData("p")]
+    [InlineData("d")]
+    [InlineData("z1")]
+    public void ALenOverTheCap_IsRejected_WithoutAllocatingIt(string format)
+    {
+        var wire = new byte[] { 1, 2, 3, 4 };
+        var allocated = AllocatedBy(() =>
+            FluentActions.Invoking(() => PayloadCompression.Decode(format, wire, 2_000_000_000))
+                .Should().Throw<InvalidDataException>().WithMessage("*out of range*"));
+        allocated.Should().BeLessThan(FewMegabytes);
+        FluentActions.Invoking(() => PayloadCompression.Decode(format, wire, PayloadCompression.MaxPayloadBytes + 1))
+            .Should().Throw<InvalidDataException>().WithMessage("*out of range*");
+    }
+
+    [Fact]
+    public void Deflate_ThatFallsShortOfAHugeLen_AllocatesWhatItInflatesTo_NotLen()
+    {
+        // Used to allocate len+1 up front: a few bytes claiming 16 MB cost 16 MB.
+        var wire = ExchangeTestKit.Deflate("hello"u8.ToArray());
+        var allocated = AllocatedBy(() =>
+            FluentActions.Invoking(() => PayloadCompression.Decode("d", wire, PayloadCompression.MaxPayloadBytes))
+                .Should().Throw<InvalidDataException>().WithMessage("*decoded to 5 bytes*"));
+        allocated.Should().BeLessThan(FewMegabytes);
+    }
+
+    [Fact]
+    public void Deflate_RightAtTheCap_StillDecodes()
+    {
+        var payload = new byte[PayloadCompression.MaxPayloadBytes];
+        payload[^1] = 7;
+        PayloadCompression.Decode("d", ExchangeTestKit.Deflate(payload), payload.Length).Should().Equal(payload);
+    }
+
+    [Fact]
+    public void Deflate_CutShort_IsRefused()
+    {
+        var payload = new byte[100_000];
+        new Random(262).NextBytes(payload);
+        var wire = ExchangeTestKit.Deflate(payload);
+
+        FluentActions.Invoking(() => PayloadCompression.Decode("d", wire[..(wire.Length / 2)], payload.Length))
+            .Should().Throw<InvalidDataException>();
+    }
+
+    [Fact]
+    public void Deflate_OneByteOverLen_AtTheCap_IsRefused()
+    {
+        var wire = ExchangeTestKit.Deflate(new byte[PayloadCompression.MaxPayloadBytes + 1]);
+
+        FluentActions.Invoking(() => PayloadCompression.Decode("d", wire, PayloadCompression.MaxPayloadBytes))
+            .Should().Throw<InvalidDataException>().WithMessage("*decoded to*");
+    }
+
+    [Fact]
+    public void Deflate_RightAtTheCap_NeverGrowsItsBufferPastTheCap()
+    {
+        // The growing buffer costs about twice its final size on the way
+        // up, plus the final 16 MB. Letting it double past len, then
+        // copying out, came to about 82 MB.
+        var wire = ExchangeTestKit.Deflate(new byte[PayloadCompression.MaxPayloadBytes]);
+        var allocated = AllocatedBy(() => PayloadCompression.Decode("d", wire, PayloadCompression.MaxPayloadBytes));
+        allocated.Should().BeLessThan(PayloadCompression.MaxPayloadBytes * 3L + FewMegabytes);
+    }
+
+    [Theory]
+    [InlineData(2_000_000_000UL)]
+    [InlineData(16UL * 1024 * 1024)]
+    public void Zstd_WhoseHeaderClaimsMoreThanLen_IsRejected_WithoutAllocatingIt(ulong claimed)
+    {
+        var payload = Encoding.UTF8.GetBytes(WpsPostShortKeys);
+        var frame = PayloadCompression.TryCompress(payload)!.Value.Bytes;
+        var lying = ExchangeTestKit.WithClaimedContentSize(frame, claimed);
+
+        var allocated = AllocatedBy(() =>
+            FluentActions.Invoking(() => PayloadCompression.Decode("z1", lying, payload.Length))
+                .Should().Throw<InvalidDataException>());
+        allocated.Should().BeLessThan(FewMegabytes);
+    }
+
+    [Fact]
+    public void Zstd_WithTheHeaderRewrittenButTrue_StillDecodes()
+    {
+        // The test's own header rewrite, checked: an 8-byte content size
+        // that tells the truth decodes as before.
+        var payload = Encoding.UTF8.GetBytes(WpsPostShortKeys);
+        var frame = PayloadCompression.TryCompress(payload)!.Value.Bytes;
+        var rewritten = ExchangeTestKit.WithClaimedContentSize(frame, (ulong)payload.Length);
+        rewritten.Should().NotEqual(frame);
+        PayloadCompression.Decode("z1", rewritten, payload.Length).Should().Equal(payload);
+    }
+
     [Theory]
     [InlineData(WpsPostLongKeys)]
     [InlineData(WpsPostShortKeys)]

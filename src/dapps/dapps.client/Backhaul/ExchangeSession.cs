@@ -53,9 +53,10 @@ public sealed class ExchangeSession
 
     private const string Prompt = "DAPPSv1>";
 
-    /// <summary>A payload bigger than this can't be meant; reading it
-    /// would only tie the session up.</summary>
-    private const int MaxWireBytes = 16 * 1024 * 1024;
+    /// <summary>A payload bigger than this, sent or decoded, can't be
+    /// meant; reading it would only tie the session up, and believing
+    /// its length would have us allocate whatever a peer says.</summary>
+    private const int MaxWireBytes = PayloadCompression.MaxPayloadBytes;
 
     private const int MaxLineBytes = 8192;
 
@@ -1189,7 +1190,11 @@ public sealed class ExchangeSession
         if (!IHaveValidator.TryGetWireLength(line, out var id, out var wireLength) || wireLength > MaxWireBytes)
         {
             // We can't tell where its payload ends, so nothing after it
-            // can be read either.
+            // can be read either. One whose bytes on the wire are said to
+            // be over the cap can't be meant, and reading it would mean
+            // taking its word for how much to allocate. One that only
+            // decodes to over the cap is read past and refused as too
+            // large (WontTake) before anything decodes it.
             OutOfStep($"can't tell how long the payload after '{Printable(line)}' is");
             return false;
         }
@@ -1233,6 +1238,9 @@ public sealed class ExchangeSession
     /// <summary>Why we won't take a message, or null when we will.</summary>
     private string? WontTake(IHaveOffer offer)
     {
+        // Before anything is allocated for it: the data that follows a
+        // send is read into a buffer of this size.
+        if (offer.Length > MaxWireBytes || offer.CompressedLength > MaxWireBytes) return "too large";
         if (settings.MaxBytes is { } max && offer.Length > max) return $"larger than {max} bytes";
         if (inbox is null) return "not taking messages";
         return null;
