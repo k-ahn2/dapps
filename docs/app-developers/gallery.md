@@ -10,6 +10,8 @@ The first three are Python + paho-mqtt:
 pip install paho-mqtt
 ```
 
+If your node requires app tokens (new installs do), mint one on the dashboard's **App tokens** page for the script's app (`chat`, `sensor` or `pager`) and pass it in `DAPPS_TOKEN`, for example `DAPPS_TOKEN='<chat token>' python chat.py ...`. With tokens off, leave it unset.
+
 The last two are browser apps (HTML + vanilla JS, MQTT-over-WebSocket via mqtt.js).
 
 Run a DAPPS instance locally, replace `<your-callsign>` with your own throughout, and try the examples in any order.
@@ -115,7 +117,10 @@ Open `index.html` directly from disk; no static server needed. The app speaks MQ
 <!-- in the HTML, abbreviated -->
 <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
 <script>
-  const client = mqtt.connect("ws://localhost:5000/mqtt", { protocolVersion: 5 });
+  const client = mqtt.connect("ws://localhost:5000/mqtt", {
+    protocolVersion: 5,
+    username: "files", password: "<token for the files app>", // leave out if app tokens are off
+  });
   client.on("connect", () => client.subscribe("dapps/in/files", { qos: 1 }));
   client.on("message", (topic, payload, packet) => {
     // split off a one-line JSON envelope, render the rest as the file
