@@ -103,16 +103,18 @@ public abstract class WpsReplicationScenarioTests(NetSimTwoNodeFixture fixture) 
 
         await fixture.ThrowIfDiedAsync($"{report}\n{Diagnostics()}");
         failure.Should().BeNull($"the test's own posting and inbox reading should work\n{report}\n{Diagnostics()}");
-        sideA.Complete.Should().BeTrue($"everything should arrive within {Deadline.TotalMinutes:F0} minutes\n{report}\n{Diagnostics()}");
-        sideB.Complete.Should().BeTrue($"{report}\n{Diagnostics()}");
+        sideA.Complete.Should().BeTrue($"{ScenarioTiming.OverCeilingTag} everything should arrive within {Deadline.TotalMinutes:F0} minutes\n{report}\n{Diagnostics()}");
+        sideB.Complete.Should().BeTrue($"{ScenarioTiming.OverCeilingTag} {report}\n{Diagnostics()}");
         (sideA.Duplicates + sideB.Duplicates).Should().Be(0, "every message should arrive exactly once\n" + report);
         (Connects("A") + Connects("B")).Should().BeLessThanOrEqualTo(MaxConnections,
             $"Kevin's trace took six connections; the exchange needs {MaxConnections - 1}, {MaxConnections} if a SABM or UA is lost\n" + report);
         var messages = sideA.PostsReceived + sideB.PostsReceived + sideA.AcksReceived + sideB.AcksReceived;
         (Frames("A") + Frames("B")).Should().BeLessThanOrEqualTo(FramesPerMessage * messages,
             $"Kevin's trace took about 14 frames a message; the exchange takes {FramesPerMessage - 2} or fewer here\n" + report);
-        elapsed.Should().BeLessThanOrEqualTo(TimeLimit,
-            $"Kevin's trace took 77 s at 1200 baud; the exchange takes about {TimeLimit.TotalSeconds / 2:F0} s here\n" + report);
+        // Last, so a wrong result is never reported as a slow one. Kevin's
+        // trace took 77 s at 1200 baud; the exchange takes about half the
+        // target here.
+        ScenarioTiming.AssertWithin("First post to last ack", elapsed, TimeLimit, report);
     }
 
     /// <summary>Most frames a message may take, with room for a slow
@@ -123,8 +125,10 @@ public abstract class WpsReplicationScenarioTests(NetSimTwoNodeFixture fixture) 
     /// one more if a SABM or UA is lost.</summary>
     protected virtual int MaxConnections => 2;
 
-    /// <summary>Longest the exchange may take, first post to last ack:
-    /// about twice what it takes on this channel.</summary>
+    /// <summary>Longest the exchange should take, first post to last ack:
+    /// about twice what it takes on this channel. Over it, the test fails and
+    /// CI reruns it once; over twice it, the test fails for good
+    /// (<see cref="ScenarioTiming"/>).</summary>
     protected abstract TimeSpan TimeLimit { get; }
 
     /// <summary>Wait (up to a minute) until neither daemon has anything left to send, then a few seconds more.</summary>
@@ -168,6 +172,8 @@ public abstract class WpsReplicationScenarioTests(NetSimTwoNodeFixture fixture) 
         sb.AppendLine("Each side acks 5 s after the first post it hasn't acked, so the number of acks depends on how fast posts arrive.");
         sb.AppendLine();
         sb.AppendLine($"Radio port: {fixture.RadioSettings}");
+        sb.AppendLine();
+        sb.AppendLine(ScenarioTiming.Line("First post to last ack", elapsed, TimeLimit));
         sb.AppendLine();
         sb.AppendLine("| | Kevin's trace, before 0.40.0 (1200 baud) | This run |");
         sb.AppendLine("|---|---|---|");

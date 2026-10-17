@@ -1841,10 +1841,33 @@ public sealed class ExchangeSessionTests : IDisposable
         }
         run.IsCompleted.Should().BeFalse();
 
-        await clock.WaitUntilPendingAsync(Ct);
-        clock.Advance(TimeSpan.FromMilliseconds(400));
-        await batch.WaitForOutcomesAsync(1, Ct);
-        await run.WaitAsync(Patience, Ct);
+        // On past the answer deadline, 1 s after ours went, nudging the fake
+        // clock in small steps until the session acts on it rather than
+        // counting on one step landing on the right timer (#347). The clock
+        // stops 0.6 s after the last pong, short of that pong plus the 1 s
+        // answer timeout: a session that took a pong as progress would
+        // still be waiting then, and fail here. The real-time waits only
+        // let the session's thread catch up, so they are generous for a
+        // loaded run. The inactivity timeout (hold 60 s + 30 s) is far off.
+        var limit = clock.GetUtcNow() + TimeSpan.FromMilliseconds(600);
+        while (batch.Outcomes.Count == 0 && clock.GetUtcNow() < limit)
+        {
+            await WaitForAsync(() => clock.Pending > 0 || batch.Outcomes.Count > 0 || run.IsCompleted, "the session neither waited nor ended");
+            if (batch.Outcomes.Count == 0) clock.Advance(TimeSpan.FromMilliseconds(100));
+        }
+        await WaitForAsync(() => batch.Outcomes.Count > 0, "no outcome for ours, though the answer deadline has passed");
+        await run.WaitAsync(LoadedPatience, Ct);
         batch.Outcomes.Single().Result.Error.Should().Contain("no answer");
+    }
+
+    /// <summary>Real time for another thread to catch up in a fake-clock
+    /// test, allowing for a loaded parallel run (#347).</summary>
+    private static readonly TimeSpan LoadedPatience = TimeSpan.FromSeconds(60);
+
+    private async Task WaitForAsync(Func<bool> condition, string failure)
+    {
+        var deadline = DateTime.UtcNow + LoadedPatience;
+        while (!condition() && DateTime.UtcNow < deadline) await Task.Delay(5, Ct);
+        if (!condition()) throw new TimeoutException(failure);
     }
 }

@@ -64,7 +64,7 @@ public abstract class DappsExchangeTests(IDappsNodePair pair) : IAsyncLifetime
         AirSent("A", "\nroutes").Should().Be(1, Transcript());
         AirSent("B", "route ").Should().BeGreaterThan(0, Transcript());
         AirSent("A", "exchange id=").Should().Be(1, Transcript());
-        air.SentBy("A").Should().ContainSingle(f => f.Contains("exchange id=") && f.Contains($"msg {id} "),
+        FramesSentBy("A").Should().ContainSingle(f => f.Contains("exchange id=") && f.Contains($"msg {id} "),
             "the rules and the message share a frame\n" + Transcript());
         AirSent("B", $"ack {id}").Should().Be(1, Transcript());
         AirSent("A", "ihave ").Should().Be(0, "a message this small goes unasked\n" + Transcript());
@@ -212,15 +212,17 @@ public abstract class DappsExchangeTests(IDappsNodePair pair) : IAsyncLifetime
         {
             throw new TimeoutException($"Never heard B's peer list. Probe said: {body}\n{Transcript()}");
         }
+        Connects("A").Should().Be(1, "one probe, one connect\n" + body + "\n" + Transcript());
         AirSent("A", "\npeers").Should().Be(1, body + "\n" + Transcript());
         AirSent("B", $"peer {a.Callsign}").Should().Be(1, "B lists A as a neighbour\n" + Transcript());
         AirSent("A", "exchange ").Should().Be(0, "a probe only asks; it never starts an exchange\n" + Transcript());
     }
 
-    /// <summary>Connects (SABM) from one DAPPS node to the other. Two BPQs
-    /// also link up between their node callsigns for NET/ROM, which isn't
-    /// DAPPS traffic and doesn't count.</summary>
-    protected int Connects(string side) => air.CountSentBy(side, $"Fm {Call(side)} To {Call(Other(side))} <C C");
+    /// <summary>Connects (SABM) from one DAPPS node to the other, a retried
+    /// SABM counted once (<see cref="AirFrames.Connects"/>). Two BPQs also
+    /// link up between their node callsigns for NET/ROM, which isn't DAPPS
+    /// traffic and doesn't count.</summary>
+    protected int Connects(string side) => AirFrames.Connects(air.Sequence(), side, pair.ApplCallA, pair.ApplCallB);
 
     protected int HangUps(string side) => air.CountSentBy(side, $"Fm {Call(side)} To {Call(Other(side))} <D C");
 
@@ -228,7 +230,19 @@ public abstract class DappsExchangeTests(IDappsNodePair pair) : IAsyncLifetime
 
     private static string Other(string side) => side == "A" ? "B" : "A";
 
-    protected int AirSent(string side, string contains) => air.CountSentBy(side, contains.Replace("\\n", "\n"));
+    /// <summary>Frames from <paramref name="side"/> with <paramref name="contains"/> in them, each frame once
+    /// (<see cref="FramesSentBy"/>).</summary>
+    protected int AirSent(string side, string contains)
+    {
+        var text = contains.Replace("\\n", "\n");
+        return FramesSentBy(side).Count(f => f.Contains(text, StringComparison.Ordinal));
+    }
+
+    /// <summary>What <paramref name="side"/> sent, each frame once: an
+    /// AX.25 retransmission of an unacknowledged frame is one frame, and the
+    /// same frame on another connection is another (<see cref="AirFrames.SentBy"/>).</summary>
+    protected IReadOnlyList<string> FramesSentBy(string side) =>
+        AirFrames.SentBy(air.Sequence(), side, pair.ApplCallA, pair.ApplCallB);
 
     /// <summary>
     /// Wait for either node to hang up the link between the two DAPPS
