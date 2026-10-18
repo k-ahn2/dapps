@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using dapps.client.Tx;
 using Microsoft.Extensions.Logging;
 
@@ -5,7 +6,9 @@ namespace dapps.client.Transport.Agw;
 
 /// <summary>
 /// Reads and writes <see cref="AgwFrame"/>s over a duplex Stream. Writes are
-/// serialised so concurrent senders can't interleave.
+/// serialised so concurrent senders can't interleave. Once
+/// <see cref="StartWriter"/> has been called, as an <see cref="AgwLink"/>
+/// does, one writer task sends them in turn instead (its doc says why).
 ///
 /// Single chokepoint for AGW-side TX gating: every AGW byte heading toward
 /// the node passes through <see cref="WriteFrameAsync"/>. The configured
@@ -32,6 +35,11 @@ public sealed class AgwFrameTransport
     private readonly IDappsTxGate txGate;
     private readonly ILogger? logger;
     private readonly SemaphoreSlim writeLock = new(1, 1);
+    // The writer (StartWriter), when there is one.
+    private Channel<QueuedWrite>? queue;
+    private CancellationTokenSource? writerStop;
+    private Task writerTask = Task.CompletedTask;
+    private readonly TaskCompletionSource<Exception> writeFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     // Ports over MaxPort already warned about on this connection: one
     // warning each, not one per frame. Touched only by the reader.
     private readonly HashSet<byte> warnedPorts = [];
@@ -66,6 +74,17 @@ public sealed class AgwFrameTransport
     /// wedged) would otherwise hold the caller for good.</summary>
     public static readonly TimeSpan RegisterReplyTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>Longest one write to the node may take once the writer
+    /// (<see cref="StartWriter"/>) has started it. BPQ reads its AGW
+    /// sockets every 100 ms; a write that has not gone in this long means
+    /// the node has stopped reading, and every caller on the connection
+    /// is stuck behind it.</summary>
+    public static readonly TimeSpan WriteStallLimit = TimeSpan.FromSeconds(30);
+
+    /// <summary>Most writes the writer holds waiting to go; a caller
+    /// beyond that waits for room.</summary>
+    public const int WriteQueueCapacity = 256;
+
     /// <summary>
     /// Most bytes one AGW 'D' frame may carry. BPQ hands a data frame to
     /// its host API's <c>SendMsgEx</c>, which starts
@@ -83,17 +102,39 @@ public sealed class AgwFrameTransport
     /// frames as it takes to keep each within <see cref="MaxDataFrameBytes"/>.
     /// The node packetises them onto the link as usual, so splitting here
     /// costs nothing on air.
+    /// The frames go out together, one after another, with nothing else
+    /// between them, or none goes: the TX gate and the limits are checked
+    /// for all of them first.
     /// </summary>
     public async Task WriteDataAsync(byte port, string callFrom, string callTo, ReadOnlyMemory<byte> data, CancellationToken ct)
     {
+        var bytes = new List<byte>(data.Length + (data.Length / MaxDataFrameBytes + 1) * AgwFrame.HeaderLength);
+        AgwFrame? first = null;
         for (var offset = 0; offset < data.Length; offset += MaxDataFrameBytes)
         {
             var chunk = data.Slice(offset, Math.Min(MaxDataFrameBytes, data.Length - offset)).ToArray();
-            await WriteFrameAsync(new AgwFrame(port, 'D', 0xF0, callFrom, callTo, chunk), ct);
+            var frame = new AgwFrame(port, 'D', 0xF0, callFrom, callTo, chunk);
+            first ??= frame;
+            bytes.AddRange(Encode(frame));
         }
+        if (first is not null) await SendAsync([.. bytes], first, ct, waitWhileGoing: true);
     }
 
-    public async Task WriteFrameAsync(AgwFrame frame, CancellationToken ct)
+    public async Task WriteFrameAsync(AgwFrame frame, CancellationToken ct) =>
+        await SendAsync(Encode(frame), frame, ct, waitWhileGoing: true);
+
+    /// <summary>
+    /// As <see cref="WriteFrameAsync"/>, but the caller stops waiting
+    /// when <paramref name="ct"/> is cancelled even once the writer has
+    /// started the write (which still goes whole): for a best-effort
+    /// frame, such as a 'd', whose caller has a short bound of its own.
+    /// </summary>
+    public async Task WriteFrameBestEffortAsync(AgwFrame frame, CancellationToken ct) =>
+        await SendAsync(Encode(frame), frame, ct, waitWhileGoing: false);
+
+    /// <summary>The frame's bytes, once it has passed BPQ's limits and the
+    /// TX gate; otherwise throws, and nothing is sent.</summary>
+    private byte[] Encode(AgwFrame frame)
     {
         var length = frame.Payload?.Length ?? 0;
         if (frame.Port > MaxPort)
@@ -112,22 +153,198 @@ public sealed class AgwFrameTransport
                 $"AGW UNPROTO frame with {length} bytes: BPQ sends at most {MaxUnprotoBytes} and drops the rest without a word", nameof(frame));
         }
 
-        if (IsRfEmitting(frame.Kind) && !txGate.TxAllowed)
+        if (IsRfEmitting(frame.Kind) && !txGate.TxAllowed) throw TxStopped(frame);
+
+        return frame.ToBytes();
+    }
+
+    private TxStoppedException TxStopped(AgwFrame frame) => new(
+        $"AGW frame kind '{frame.Kind}' (port {frame.Port}, {frame.CallFrom}->{frame.CallTo}): {txGate.BlockReason ?? "(no reason)"}");
+
+    /// <param name="first">The (first) frame <paramref name="bytes"/> holds:
+    /// its kind says whether the TX gate applies, and it names the write
+    /// if the gate stops it.</param>
+    /// <param name="waitWhileGoing">Once the writer has started the
+    /// write, wait for it whatever <paramref name="ct"/> says.</param>
+    private async Task SendAsync(byte[] bytes, AgwFrame first, CancellationToken ct, bool waitWhileGoing)
+    {
+        if (queue is null)
         {
-            throw new TxStoppedException(
-                $"AGW frame kind '{frame.Kind}' (port {frame.Port}, {frame.CallFrom}->{frame.CallTo}): {txGate.BlockReason ?? "(no reason)"}");
+            await writeLock.WaitAsync(ct);
+            try
+            {
+                await stream.WriteAsync(bytes, ct);
+                await stream.FlushAsync(ct);
+            }
+            finally
+            {
+                writeLock.Release();
+            }
+            return;
         }
 
-        var bytes = frame.ToBytes();
-        await writeLock.WaitAsync(ct);
+        var write = new QueuedWrite(bytes, IsRfEmitting(first.Kind) ? first : null);
         try
         {
-            await stream.WriteAsync(bytes, ct);
-            await stream.FlushAsync(ct);
+            await queue.Writer.WriteAsync(write, ct);
+        }
+        catch (ChannelClosedException)
+        {
+            throw WriterClosed();
+        }
+        try
+        {
+            await write.Done.Task.WaitAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Not started: it never goes. Started: it goes whole (a frame
+            // cut short would leave the node reading the next frame's
+            // header out of this one's data, on every session at once),
+            // and the caller hears how that went.
+            if (write.TryCancel() || !waitWhileGoing) throw;
+            await write.Done.Task;
+        }
+    }
+
+    /// <summary>
+    /// From now on writes go through one writer task, in the order they
+    /// were made, rather than each taking a lock and writing for itself.
+    /// A caller whose token is cancelled while its write waits its turn
+    /// takes it back; once the write has started it goes whole. A write
+    /// that has not gone within <see cref="WriteStallLimit"/> (on
+    /// <paramref name="clock"/>; the system clock if null) fails, as does
+    /// every write after it, and <see cref="WriteFailed"/> completes: one
+    /// connection carries every session, call and beacon, and a node that
+    /// has stopped reading would otherwise hold them all for good, with
+    /// nothing to say so. The limit is for one whole write: BPQ reads one
+    /// AGW frame per socket every 100 ms (about 2.5 KB/s in 'D' frames),
+    /// so only a message of several MB in one write could reach it; 300 KB
+    /// through real linbpq took 2 min 9 s, and went.
+    /// The TX gate is checked again just before each write that would go
+    /// on air, as <see cref="IDappsTxGate"/> asks: one queued before TX
+    /// was stopped fails whole with a <see cref="TxStoppedException"/>,
+    /// and nothing of it is sent. Node-control frames and 'd' still go.
+    /// </summary>
+    public void StartWriter(TimeProvider? clock = null)
+    {
+        if (queue is not null) throw new InvalidOperationException("the writer has already started");
+        queue = Channel.CreateBounded<QueuedWrite>(new BoundedChannelOptions(WriteQueueCapacity)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+        writerStop = new CancellationTokenSource();
+        writerTask = Task.Run(() => RunWriterAsync(queue, clock ?? TimeProvider.System, writerStop.Token));
+    }
+
+    /// <summary>Completes, with the reason, once a write has failed or
+    /// stalled (<see cref="StartWriter"/>). Nothing more is written then.</summary>
+    public Task<Exception> WriteFailed => writeFailed.Task;
+
+    /// <summary>Stops the writer, failing every write still waiting with
+    /// an <see cref="IOException"/>, and waits for it to finish.</summary>
+    public async Task StopWriterAsync()
+    {
+        if (queue is null || writerStop is null) return;
+        queue.Writer.TryComplete();
+        await writerStop.CancelAsync();
+        try { await writerTask; } catch { /* its failures went to the callers */ }
+    }
+
+    private async Task RunWriterAsync(Channel<QueuedWrite> writes, TimeProvider clock, CancellationToken stop)
+    {
+        try
+        {
+            await foreach (var write in writes.Reader.ReadAllAsync(stop))
+            {
+                if (!write.TryStart()) continue;
+                if (write.Rf is { } rf && !txGate.TxAllowed)
+                {
+                    write.Done.TrySetException(TxStopped(rf));
+                    continue;
+                }
+                try
+                {
+                    var sending = WriteToStreamAsync(write.Bytes, stop);
+                    if (!sending.IsCompleted)
+                    {
+                        // Left behind if it stalls: the socket's close ends it.
+                        _ = sending.ContinueWith(t => _ = t.Exception, CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                        await sending.WaitAsync(WriteStallLimit, clock, stop);
+                    }
+                    await sending;
+                    write.Done.TrySetResult();
+                }
+                catch (TimeoutException)
+                {
+                    var stalled = new IOException(
+                        $"AGW: a write to the node has not gone in {WriteStallLimit.TotalSeconds:F0}s; the node is not reading, so the connection is closed");
+                    write.Done.TrySetException(stalled);
+                    writeFailed.TrySetResult(stalled);
+                    return;
+                }
+                catch (OperationCanceledException) when (stop.IsCancellationRequested)
+                {
+                    write.Done.TrySetException(WriterClosed());
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // The socket's write side has gone: so has the connection.
+                    write.Done.TrySetException(ex is IOException ? ex : new IOException($"AGW: a write to the node failed: {ex.Message}", ex));
+                    writeFailed.TrySetResult(ex);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested)
+        {
         }
         finally
         {
-            writeLock.Release();
+            writes.Writer.TryComplete();
+            while (writes.Reader.TryRead(out var left))
+            {
+                left.TryCancel(WriterClosed());
+            }
+        }
+    }
+
+    private async Task WriteToStreamAsync(byte[] bytes, CancellationToken ct)
+    {
+        await stream.WriteAsync(bytes, ct);
+        await stream.FlushAsync(ct);
+    }
+
+    private static IOException WriterClosed() => new("AGW: the connection to the node has closed");
+
+    /// <summary>One write waiting for, or taken by, the writer.</summary>
+    private sealed class QueuedWrite(byte[] bytes, AgwFrame? rf)
+    {
+        private const int Waiting = 0, Started = 1, Cancelled = 2;
+        private int state;
+
+        public byte[] Bytes { get; } = bytes;
+
+        /// <summary>Its (first) frame, when it would go on air: the TX
+        /// gate applies.</summary>
+        public AgwFrame? Rf { get; } = rf;
+        public TaskCompletionSource Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The writer takes it; false if its caller took it back.</summary>
+        public bool TryStart() => Interlocked.CompareExchange(ref state, Started, Waiting) == Waiting;
+
+        /// <summary>Its caller takes it back (or, with a
+        /// <paramref name="reason"/>, the writer stopping fails it); false
+        /// once the writer has it.</summary>
+        public bool TryCancel(Exception? reason = null)
+        {
+            if (Interlocked.CompareExchange(ref state, Cancelled, Waiting) != Waiting) return false;
+            if (reason is null) Done.TrySetCanceled();
+            else Done.TrySetException(reason);
+            return true;
         }
     }
 
