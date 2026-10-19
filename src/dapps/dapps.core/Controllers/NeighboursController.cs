@@ -27,12 +27,15 @@ public class NeighboursController(Database database) : ControllerBase
             // (round-trip with ParseLines/ToLines) instead of the raw
             // JSON, since that's what the operator typed in.
             var script = ConnectScript.FromJson(n.ConnectScriptJson);
-            return new NeighbourModel(n.Callsign, n.BearerPort, n.UdpEndpoint,
+            // A port still waiting to be converted counts from 0 (#233):
+            // not shown as a number, which a script could post back one low.
+            return new NeighbourModel(n.Callsign, n.PortPending == true ? null : n.BearerPort, n.UdpEndpoint,
                 ConnectScript: script?.ToLines(),
                 ConnectScriptStepCount: script?.Steps.Count ?? 0,
                 CompressionEnabled: n.CompressionEnabled,
                 SessionTailSeconds: n.SessionTailSeconds,
-                ConnectVia: n.ConnectVia);
+                ConnectVia: n.ConnectVia,
+                PortPending: n.PortPending == true);
         });
     }
 
@@ -44,6 +47,28 @@ public class NeighboursController(Database database) : ControllerBase
             return BadRequest("Callsign is required");
         }
         var callsign = neighbour.Callsign.Trim().ToUpperInvariant();
+        // Port is the node's own number for the radio port (#233). An older
+        // caller's BearerPort counted from 0, and is still taken that way
+        // when Port is not sent. Deprecated.
+        var port = neighbour.Port;
+        if (port is null && neighbour.BearerPort is { } counted)
+        {
+            if (counted < 0) return BadRequest("BearerPort counts the node's ports from 0; it can't be negative. Send Port, the node's own port number, instead.");
+            port = counted + 1;
+        }
+        // While the row's port waits to be converted it is shown as null:
+        // posting null, or the old count-from-0 value, back would store the
+        // wrong port. Wait for the conversion (seconds after the node's AGW
+        // connection answers) or send another value.
+        var existing = await database.GetNeighbour(callsign);
+        if (existing is { PortPending: true } && (port is null || port == existing.BearerPort))
+        {
+            return Conflict($"{callsign}'s radio port was saved by an older DAPPS, which counted from 0, and is waiting to be converted to the node's own number; send the port as your node numbers it once that is done (GET /Neighbours shows it then), or a different value now.");
+        }
+        if (port is < 1)
+        {
+            return BadRequest("Port: the node's own number for the radio port (XRouter's PORT=, BPQ's PORTNUM, pdn's PORTS list); ports count from 1.");
+        }
         var connectVia = string.IsNullOrWhiteSpace(neighbour.ConnectVia) ? null : neighbour.ConnectVia.Trim().ToUpperInvariant();
         string? scriptJson = null;
         if (!string.IsNullOrWhiteSpace(neighbour.ConnectScript))
@@ -75,7 +100,7 @@ public class NeighboursController(Database database) : ControllerBase
         }
         await database.UpsertNeighbour(
             callsign,
-            neighbour.BearerPort,
+            port,
             string.IsNullOrWhiteSpace(neighbour.UdpEndpoint) ? null : neighbour.UdpEndpoint.Trim(),
             connectScriptJson: scriptJson,
             compressionEnabled: neighbour.CompressionEnabled,
@@ -96,8 +121,16 @@ public class NeighboursController(Database database) : ControllerBase
 /// Wire shape for /Neighbours. <see cref="UdpEndpoint"/> ("host:port") is
 /// set when this neighbour is reachable over the UDP datagram backhaul;
 /// null routes via the configured node bearer (AGW or RHPv2).
-/// <see cref="BearerPort"/> is the 0-indexed bearer port; null falls back
-/// to DefaultBearerPort.
+/// <see cref="Port"/> is the radio port the neighbour is called on, the
+/// node's own number for it (#233): XRouter's <c>PORT=</c>, BPQ's
+/// <c>PORTNUM</c>, pdn's port as its <c>PORTS</c> command lists it; null
+/// falls back to the default port. <see cref="BearerPort"/> is the name it
+/// had up to 0.52, when it counted from 0: still taken on a POST without
+/// <see cref="Port"/>, never sent. Deprecated. <see cref="PortPending"/>
+/// (read-only) is true while a port saved by an older DAPPS waits to be
+/// converted; the neighbour isn't called until then, and <see cref="Port"/>
+/// is null meanwhile. A POST to such a row with no port, or with the old
+/// value, is refused (409) rather than stored one too low.
 ///
 /// <para>
 /// <see cref="ConnectScript"/> is the optional human-readable
@@ -136,10 +169,13 @@ public class NeighboursController(Database database) : ControllerBase
 /// </summary>
 public sealed record NeighbourModel(
     string Callsign,
-    int? BearerPort,
+    int? Port,
     string? UdpEndpoint = null,
     string? ConnectScript = null,
     int ConnectScriptStepCount = 0,
     bool? CompressionEnabled = null,
     int? SessionTailSeconds = null,
-    string? ConnectVia = null);
+    string? ConnectVia = null,
+    bool PortPending = false,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    int? BearerPort = null);

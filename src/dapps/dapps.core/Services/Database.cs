@@ -518,6 +518,10 @@ public class Database(
         else
         {
             channel.Id = existing.Id;
+            // Written by an operator or the REST API: the key is the node's
+            // own number now (#233), even if the row was waiting to be
+            // converted.
+            channel.PortPending = null;
             await connection.UpdateAsync(channel);
         }
     }
@@ -589,6 +593,10 @@ public class Database(
         }
         else
         {
+            // Whatever an operator or the REST API writes is the node's own
+            // number (#233), even while a port saved by an older DAPPS waits
+            // to be converted: the row is no longer pending.
+            existing.PortPending = null;
             existing.BearerPort = bearerPort;
             existing.UdpEndpoint = udpEndpoint;
             existing.ConnectScriptJson = connectScriptJson;
