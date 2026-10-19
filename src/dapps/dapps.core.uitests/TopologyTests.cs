@@ -182,9 +182,8 @@ public sealed class TopologyTests(LoggedInWebAppFixture app, PlaywrightFixture p
             var id = await page.EvaluateAsync<int>(@"() => {
                 for (const tr of document.querySelectorAll('#chan-body tr')) {
                     if (tr.textContent.includes('" + channelKey + @"')) {
-                        const btn = tr.querySelector('button.link-btn.danger');
-                        const m = btn?.getAttribute('onclick')?.match(/dappsDeleteChannel\((\d+)\)/);
-                        if (m) return parseInt(m[1], 10);
+                        const id = tr.querySelector('button[data-act=""delete-channel""]')?.dataset.id;
+                        if (id) return parseInt(id, 10);
                     }
                 }
                 return -1;
@@ -257,6 +256,42 @@ public sealed class TopologyTests(LoggedInWebAppFixture app, PlaywrightFixture p
         {
             using var db = new SQLite.SQLiteConnection(app.DatabasePath);
             db.Execute("delete from neighbours where Callsign = ?", testCallsign);
+        }
+    }
+
+    /// <summary>
+    /// Callsigns come from remote nodes. One shaped to break out of a
+    /// quoted inline handler must neither run script nor change what the
+    /// row buttons act on (#317): the confirm text carries it verbatim.
+    /// </summary>
+    [Fact]
+    public async Task Topology_Neighbours_HostileCallsign_DoesNotRunScript_AndRoundTripsToButtons()
+    {
+        const string hostile = "A');window.__pwned=1;('";
+        using (var db = new SQLite.SQLiteConnection(app.DatabasePath))
+        {
+            db.Execute("insert into neighbours (Callsign, BearerPort, PortPending) values (?, 1, 0)", hostile);
+        }
+        try
+        {
+            await using var ctx = await pw.Browser.NewLoggedInContextAsync(app);
+            var page = await ctx.NewPageAsync();
+            string? confirmText = null;
+            page.Dialog += async (_, dlg) => { confirmText = dlg.Message; await dlg.DismissAsync(); };
+            await page.GotoAsync($"{app.BaseUrl}/Topology?tab=neighbours");
+            var row = page.Locator("#neigh-body tr", new PageLocatorOptions { HasText = "__pwned" });
+            await row.WaitForAsync(new LocatorWaitForOptions { Timeout = 30_000 });
+
+            await row.Locator("button:has-text('remove')").ClickAsync();
+            await page.WaitForFunctionAsync("() => true");
+            confirmText.Should().Be($"Remove neighbour {hostile}?");
+            (await page.EvaluateAsync<bool>("() => window.__pwned === undefined")).Should().BeTrue(
+                "a callsign must never be executed as script");
+        }
+        finally
+        {
+            using var db = new SQLite.SQLiteConnection(app.DatabasePath);
+            db.Execute("delete from neighbours where Callsign = ?", hostile);
         }
     }
 
