@@ -117,7 +117,8 @@ public sealed class AgwUiDiscoveryTests
         var ct = TestContext.Current.CancellationToken;
         await using var h = new AgwInboundServiceHarness(Local);
         h.Options.Set(h.With(o => o.NodeBearer = "rhpv2"));
-        await using var bearer = new AgwUiDiscoveryBearer(h.Service, h.Logs);
+        var rhp = new RecordingUiSender();
+        await using var bearer = new AgwUiDiscoveryBearer(h.Service, h.Logs, rhp);
         await bearer.StartAsync([Channel(1, 1)], ct);
         await using var heard = bearer.ListenAsync(ct).GetAsyncEnumerator(ct);
 
@@ -127,9 +128,14 @@ public sealed class AgwUiDiscoveryTests
         link!.ListenOnly.Should().BeTrue();
         h.Service.State.Should().Be(AgwLinkState.Open);
 
-        // BPQ sends an 'M' from the header's CallFrom, registered or not.
+        // XRouter drops an 'M' from a socket that registered no callsign:
+        // the beacon goes through the bearer, from our callsign, and the
+        // link sends none.
         await bearer.AnnounceAsync(new BeaconFrame(Local, 0, 600, new AgwBearerHint(1)), "1", ct);
-        (await bpq.ReadUntilAsync('M', ct)).CallFrom.Should().Be(Local);
+        var sent = rhp.Sent.Should().ContainSingle().Subject;
+        (sent.Port, sent.From, sent.To).Should().Be(((byte)1, Local, "DAPPS"));
+        Encoding.ASCII.GetString(sent.Payload).Should().StartWith($"DAPPS v1 callsign={Local}");
+        await FluentActions.Awaiting(() => link.SendUiAsync(1, "DAPPS", [1], ct)).Should().ThrowAsync<InvalidOperationException>();
         await bpq.WriteAsync(ct, Ui(1, "G7XYZ-9", "DAPPS v1 callsign=G7XYZ-9 hops=0 ttl=600"));
         ((ReceivedBeacon)await NextAsync(heard, ct)).Beacon.Callsign.Should().Be("G7XYZ-9");
 
@@ -144,9 +150,27 @@ public sealed class AgwUiDiscoveryTests
         await FluentActions.Awaiting(() => link.DialAsync(1, Local, Remote, TimeSpan.FromMinutes(3), ct))
             .Should().ThrowAsync<InvalidOperationException>();
 
-        (await bpq.DrainAsync(ct)).Should().NotContain(f => f.Kind == 'C' || f.Kind == 'D' || f.Kind == 'X');
-        bpq.Received.Should().NotContain(f => f.Kind == 'X' || f.Kind == 'D');
+        (await bpq.DrainAsync(ct)).Should().NotContain(f => f.Kind == 'C' || f.Kind == 'D' || f.Kind == 'X' || f.Kind == 'M');
+        bpq.Received.Should().NotContain(f => f.Kind == 'X' || f.Kind == 'D' || f.Kind == 'M');
         h.Metrics.Take().AgwReconnects.Should().Be(0, "nothing was registered");
+    }
+
+    [Fact]
+    public async Task AListenOnlyLinkWithNothingToSendThrough_SendsNoM()
+    {
+        // Falling back to an 'M' would look sent and go nowhere on XRouter.
+        var ct = TestContext.Current.CancellationToken;
+        await using var h = new AgwInboundServiceHarness(Local);
+        h.Options.Set(h.With(o => o.NodeBearer = "rhpv2"));
+        await using var bearer = new AgwUiDiscoveryBearer(h.Service, h.Logs);
+        await bearer.StartAsync([Channel(1, 1)], ct);
+        await h.Service.StartAsync(ct);
+        using var bpq = await AcceptListenOnlyAsync(h.Host, ct);
+        await h.Service.GetLinkAsync(FakeAgwHost.FrameTimeout, ct);
+
+        (await FluentActions.Awaiting(() => bearer.AnnounceAsync(new BeaconFrame(Local, 0, 600, new AgwBearerHint(1)), "1", ct))
+            .Should().ThrowAsync<InvalidOperationException>()).Which.Message.Should().Contain("nothing else sends UI frames");
+        (await bpq.DrainAsync(ct)).Should().NotContain(f => f.Kind == 'M');
     }
 
     [Fact]
@@ -155,7 +179,8 @@ public sealed class AgwUiDiscoveryTests
         var ct = TestContext.Current.CancellationToken;
         var clock = new ObservableTimeProvider();
         await using var h = new AgwInboundServiceHarness(Local, clock);
-        await using var bearer = new AgwUiDiscoveryBearer(h.Service, h.Logs);
+        var rhp = new RecordingUiSender();
+        await using var bearer = new AgwUiDiscoveryBearer(h.Service, h.Logs, rhp);
         await bearer.StartAsync([Channel(1, 1)], ct);
         using var full = await h.StartAsync(ct);
 
@@ -165,13 +190,19 @@ public sealed class AgwUiDiscoveryTests
         using var listening = await AcceptListenOnlyAsync(h.Host, ct);
         (await h.Service.GetLinkAsync(FakeAgwHost.FrameTimeout, ct))!.ListenOnly.Should().BeTrue();
         await bearer.AnnounceAsync(new BeaconFrame(Local, 0, 600, new AgwBearerHint(1)), "1", ct);
-        (await listening.ReadUntilAsync('M', ct)).CallFrom.Should().Be(Local);
+        rhp.Sent.Should().ContainSingle().Which.From.Should().Be(Local);
+        (await listening.DrainAsync(ct)).Should().NotContain(f => f.Kind == 'M');
 
         h.Options.Set(h.With(o => o.NodeBearer = "agw"));
         await clock.WaitForTimerAsync(AgwInboundService.NonFailureRetryDelay, ct);
         clock.Advance(AgwInboundService.NonFailureRetryDelay);
         using var registered = await AcceptRegisteredAsync(h.Host, ct);
         (await h.Service.GetLinkAsync(FakeAgwHost.FrameTimeout, ct))!.ListenOnly.Should().BeFalse();
+
+        // Registered again: the beacon goes on the link as an 'M'.
+        await bearer.AnnounceAsync(new BeaconFrame(Local, 0, 600, new AgwBearerHint(1)), "1", ct);
+        (await registered.ReadUntilAsync('M', ct)).CallFrom.Should().Be(Local);
+        rhp.Sent.Should().HaveCount(1);
     }
 
     [Fact]
@@ -324,11 +355,17 @@ public sealed class AgwUiDiscoveryTests
                 await bpq.ReadUntilAsync('M', ct);
                 for (var flap = 1; flap <= 3; flap++)
                 {
+                    // Only a timer started after the close is the backoff's.
+                    // GetLinkAsync on this clock starts a wait of the same
+                    // 10 s when it runs before the link is published; matched
+                    // here instead, the advance came before the backoff's
+                    // timer and the reconnect never came.
+                    clock.ForgetCreatedTimers();
                     bpq.Close();
                     await clock.WaitForTimerAsync(ReconnectBackoffSchedule.DelayForAttempt(1), ct);
                     clock.Advance(ReconnectBackoffSchedule.DelayForAttempt(1));
                     bpq = await AcceptRegisteredAsync(h.Host, ct);
-                    await h.Service.GetLinkAsync(FakeAgwHost.FrameTimeout, ct);
+                    await WaitForLinkAsync(h.Service, ct);
                     (await bpq.DrainAsync(ct, TimeSpan.FromSeconds(1.5))).Should().NotContain(f => f.Kind == 'M',
                         $"the channel beaconed moments ago (reconnect {flap})");
                 }
@@ -369,6 +406,46 @@ public sealed class AgwUiDiscoveryTests
         });
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ABeaconTheSenderSaysWasNotSent_IsNotCharged_AndIsOneLine_ButOneThatMayHaveGoneIs(bool notSent)
+    {
+        // Through RHPv2 from a listen-only link: a refusal, a port that
+        // cannot be matched or no node is known not to have gone. A
+        // timeout once the sendto went may have, and stays charged.
+        var ct = TestContext.Current.CancellationToken;
+        await WithDatabaseAsync(async () =>
+        {
+            await using var h = new AgwInboundServiceHarness(Local);
+            h.Options.Set(h.With(o => o.NodeBearer = "rhpv2"));
+            var airtime = new AirtimeAccountant(h.Options, TimeProvider.System, new Logger<AirtimeAccountant>(h.Logs));
+            var sender = new ThrowingUiSender(notSent
+                ? new UiFrameNotSentException("RHP: not sending on AGW port 1: test")
+                : new IOException("RHP: the UI frame may have gone"));
+            var service = await StartDiscoveryAsync(h.Options, h.Logs, h.Service, 1800, ct, airtime, sender: sender);
+            try
+            {
+                await h.Service.StartAsync(ct);
+                using var bpq = await AcceptListenOnlyAsync(h.Host, ct);
+                var line = await h.Logs.WaitForAsync("announce on agw/1 failed", ct);
+                if (notSent)
+                {
+                    line.Exception.Should().BeNull("one line, no stack trace");
+                    airtime.ConsumedSecondsLastHour.Should().Be(0);
+                }
+                else
+                {
+                    airtime.ConsumedSecondsLastHour.Should().BeGreaterThan(0);
+                }
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+        });
+    }
+
     [Fact]
     public async Task WhileTheLinkIsDown_TheServiceDoesNotSpin()
     {
@@ -401,7 +478,7 @@ public sealed class AgwUiDiscoveryTests
 
     private static async Task<DiscoveryService> StartDiscoveryAsync(
         MutableOptionsMonitor<SystemOptions> options, CapturingLoggerFactory logs, IAgwLinkSource links, int beaconIntervalSeconds,
-        CancellationToken ct, AirtimeAccountant? airtime = null, TimeSpan? reload = null)
+        CancellationToken ct, AirtimeAccountant? airtime = null, TimeSpan? reload = null, IUiFrameSender? sender = null)
     {
         var database = new Database(NullLogger<Database>.Instance, options);
         await database.UpsertDiscoveryChannel(new DbDiscoveryChannel
@@ -409,7 +486,8 @@ public sealed class AgwUiDiscoveryTests
             Bearer = "agw", ChannelKey = "1", LinkClass = LinkClass.VhfUhfFm, BeaconIntervalSeconds = beaconIntervalSeconds,
         });
         var service = new DiscoveryService(
-            database, options, TimeProvider.System, logs, new Logger<DiscoveryService>(logs), airtime: airtime, agwLinks: links)
+            database, options, TimeProvider.System, logs, new Logger<DiscoveryService>(logs), airtime: airtime, agwLinks: links,
+            listenOnlyUiSender: sender)
         {
             ChannelReloadInterval = reload ?? TimeSpan.FromMilliseconds(100),
         };
@@ -453,6 +531,18 @@ public sealed class AgwUiDiscoveryTests
 
     /// <summary>Accepts the service's next connection and plays BPQ up to
     /// its monitor 'm'.</summary>
+    /// <summary>Waits in real time for the service to publish a link,
+    /// starting no timer on the test's clock.</summary>
+    private static async Task WaitForLinkAsync(AgwInboundService service, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + FakeAgwHost.FrameTimeout;
+        while (service.TryGetLink() is null)
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException("the link was not published");
+            await Task.Delay(10, ct);
+        }
+    }
+
     private static async Task<FakeAgwSocket> AcceptRegisteredAsync(FakeAgwHost host, CancellationToken ct)
     {
         var socket = await host.AcceptAsync(ct);
@@ -503,5 +593,23 @@ public sealed class AgwUiDiscoveryTests
         {
             public void Dispose() { }
         }
+    }
+
+    /// <summary>Stands in for the RHPv2 sender: records each UI frame.</summary>
+    private sealed class RecordingUiSender : IUiFrameSender
+    {
+        public List<(byte Port, string From, string To, byte[] Payload)> Sent { get; } = [];
+
+        public Task SendUiAsync(byte bearerPort, string from, string to, byte[] payload, AgwPortList? agwPorts, CancellationToken ct)
+        {
+            lock (Sent) Sent.Add((bearerPort, from, to, payload));
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingUiSender(Exception failure) : IUiFrameSender
+    {
+        public Task SendUiAsync(byte bearerPort, string from, string to, byte[] payload, AgwPortList? agwPorts, CancellationToken ct) =>
+            Task.FromException(failure);
     }
 }

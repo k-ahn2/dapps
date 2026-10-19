@@ -34,7 +34,8 @@ public sealed class DiscoveryService(
     AirtimeAccountant? airtime = null,
     OperationalMetrics? metrics = null,
     TransmissionAuditService? transmissionAudit = null,
-    IAgwLinkSource? agwLinks = null) : BackgroundService
+    IAgwLinkSource? agwLinks = null,
+    IUiFrameSender? listenOnlyUiSender = null) : BackgroundService
 {
     private static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(1);
 
@@ -241,7 +242,7 @@ public sealed class DiscoveryService(
     {
         return bearerName switch
         {
-            "agw" when agwLinks is not null => new AgwUiDiscoveryBearer(agwLinks, loggerFactory),
+            "agw" when agwLinks is not null => new AgwUiDiscoveryBearer(agwLinks, loggerFactory, listenOnlyUiSender),
             "udp" => new UdpMulticastDiscoveryBearer(opts.Callsign, loggerFactory),
             _ => null,
         };
@@ -399,10 +400,11 @@ public sealed class DiscoveryService(
                         beaconOk = true;
                         lastBeacon[key] = (now, beacon.Callsign);
                     }
-                    catch (AgwLinkDownException ex)
+                    catch (Exception ex) when (ex is AgwLinkDownException or UiFrameNotSentException)
                     {
-                        // The node is not connected: one line, and no
-                        // beacon held back for when it is, nor charged.
+                        // The node is not connected, or the frame was
+                        // refused before it could go: one line, and no
+                        // beacon held back for later, nor charged.
                         airtime?.Release($"beacon {kv.Key}/{ch.ChannelKey}", ch.ChannelKey);
                         logger.LogWarning("DiscoveryService: announce on {0}/{1} failed: {2}", kv.Key, ch.ChannelKey, ex.Message);
                         beaconErr = ex.GetType().Name;
@@ -466,7 +468,7 @@ public sealed class DiscoveryService(
                             "DiscoveryService: scheduled solicit on {0}/{1}",
                             kv.Key, ch.ChannelKey);
                     }
-                    catch (AgwLinkDownException ex)
+                    catch (Exception ex) when (ex is AgwLinkDownException or UiFrameNotSentException)
                     {
                         airtime?.Release($"scheduled-solicit {kv.Key}/{ch.ChannelKey}", ch.ChannelKey);
                         logger.LogWarning("DiscoveryService: scheduled solicit on {0}/{1} failed: {2}", kv.Key, ch.ChannelKey, ex.Message);
@@ -670,7 +672,7 @@ public sealed class DiscoveryService(
             }
         }
         catch (OperationCanceledException) { /* shutdown */ }
-        catch (AgwLinkDownException ex)
+        catch (Exception ex) when (ex is AgwLinkDownException or UiFrameNotSentException)
         {
             airtime?.Release($"solicit-reply {bearer.Name}/{rs.ChannelKey}", rs.ChannelKey);
             logger.LogWarning("DiscoveryService: failed to reply to solicit on {0}/{1}: {2}", bearer.Name, rs.ChannelKey, ex.Message);
