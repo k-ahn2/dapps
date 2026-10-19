@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using dapps.core.Models;
 using dapps.core.Services;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SQLite;
 
@@ -436,6 +437,74 @@ public sealed class DbStartupTests : IAsyncLifetime
         c.Find<DbSystemOption>("Callsign")!.Value.Should().Be("M9YYY-7",
             "an empty PDN_APP_CALLSIGN is not an assignment - fall back to derivation");
         DbStartup.ReadNodeAssignedCallsign().Should().BeNull("whitespace/empty is treated as unset");
+    }
+
+    [Fact]
+    public void EnsureSchemaAndSeed_CallsignFromCrlfEnvFile_IsTrimmed()
+    {
+        SetEnv("DAPPS_CALLSIGN", "G0TST\r");
+
+        DbStartup.EnsureSchemaAndSeed();
+
+        using var c = DbInfo.GetConnection();
+        c.Find<DbSystemOption>("Callsign")!.Value.Should().Be("G0TST");
+    }
+
+    [Fact]
+    public void EnsureSchemaAndSeed_EnvManagedMode_CrlfCallsignIsTrimmedAtEveryStart()
+    {
+        SetEnv("DAPPS_CALLSIGN", "G0TST");
+        DbStartup.EnsureSchemaAndSeed();
+
+        SetEnv("DAPPS_ENV_MANAGED", "true");
+        SetEnv("DAPPS_CALLSIGN", "G0TST-7\r");
+        DbStartup.EnsureSchemaAndSeed();
+
+        using var c = DbInfo.GetConnection();
+        c.Find<DbSystemOption>("Callsign")!.Value.Should().Be("G0TST-7");
+    }
+
+    [Fact]
+    public void EnsureSchemaAndSeed_InvalidCallsign_LogsAnError()
+    {
+        // PDN_APP_CALLSIGN is bound verbatim, so nothing else stops a
+        // malformed one reaching the database (#359).
+        SetEnv("PDN_APP_CALLSIGN", "G0TST-99");
+        var logs = new CapturingLoggerFactory();
+
+        DbStartup.EnsureSchemaAndSeed(logs.CreateLogger("DbStartup"));
+
+        logs.Entries.Should().Contain(e => e.Level == LogLevel.Error && e.Message.Contains("'G0TST-99' is not valid"));
+    }
+
+    [Fact]
+    public void EnsureSchemaAndSeed_InvalidCallsignWithCr_LogsItVisibly()
+    {
+        // Stored before the env value was trimmed; nothing trims it now.
+        DbStartup.EnsureSchemaAndSeed();
+        using (var c = DbInfo.GetConnection())
+        {
+            var row = c.Find<DbSystemOption>("Callsign")!;
+            row.Value = "G0TST\r";
+            c.Update(row);
+        }
+        var logs = new CapturingLoggerFactory();
+
+        DbStartup.EnsureSchemaAndSeed(logs.CreateLogger("DbStartup"));
+
+        logs.Entries.Should().Contain(e => e.Level == LogLevel.Error && e.Message.Contains(@"'G0TST\x0D' is not valid"));
+        logs.Entries.Should().NotContain(e => e.Message.Contains('\r'));
+    }
+
+    [Fact]
+    public void EnsureSchemaAndSeed_ValidCallsign_LogsNoError()
+    {
+        SetEnv("DAPPS_CALLSIGN", "G0TST-7");
+        var logs = new CapturingLoggerFactory();
+
+        DbStartup.EnsureSchemaAndSeed(logs.CreateLogger("DbStartup"));
+
+        logs.Entries.Should().NotContain(e => e.Level >= LogLevel.Error);
     }
 
     [Fact]
