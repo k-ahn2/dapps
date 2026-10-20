@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.Mvc.RazorPages;
 namespace dapps.core.Pages;
 
 [IgnoreAntiforgeryToken]
-public sealed class LoginModel(AdminPasswordStore store) : PageModel
+public sealed class LoginModel(AdminPasswordStore store, AuthThrottle throttle) : PageModel
 {
     [BindProperty] public string Password { get; set; } = "";
     public string? Error { get; private set; }
@@ -31,6 +31,15 @@ public sealed class LoginModel(AdminPasswordStore store) : PageModel
     {
         ReturnUrl = returnUrl;
 
+        var address = HttpContext.Connection.RemoteIpAddress;
+        if (throttle.Begin("login", address) is { } wait)
+        {
+            Error = $"Too many wrong passwords. Try again in {(int)Math.Ceiling(wait.TotalSeconds)} seconds.";
+            Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            Response.Headers["Retry-After"] = ((int)Math.Ceiling(wait.TotalSeconds)).ToString();
+            return Page();
+        }
+
         if (!await store.VerifyAsync(Password))
         {
             Error = "Wrong password.";
@@ -40,6 +49,8 @@ public sealed class LoginModel(AdminPasswordStore store) : PageModel
             await Task.Delay(150);
             return Page();
         }
+
+        throttle.Succeeded("login", address);
 
         await AdminSession.SignInAsync(HttpContext);
 

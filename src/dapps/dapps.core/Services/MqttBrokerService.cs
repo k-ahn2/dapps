@@ -37,8 +37,11 @@ public sealed class MqttBrokerService(
     IOptionsMonitor<SystemOptions> options,
     Database database,
     AppTokenStore tokens,
-    MqttServer server) : IHostedService
+    MqttServer server,
+    AuthThrottle? throttleOrNull = null) : IHostedService
 {
+    private readonly AuthThrottle throttle = throttleOrNull ?? new AuthThrottle(TimeProvider.System);
+
     private const string OutTopicPrefix = "dapps/out/";
     private const string InTopicPrefix = "dapps/in/";
     private const string AckTopicPrefix = "dapps/ack/";
@@ -66,6 +69,10 @@ public sealed class MqttBrokerService(
     /// running can't let the connection through. Guarded by
     /// <see cref="clientAppsLock"/>.</summary>
     private readonly Dictionary<string, long> tokenGenerations = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Maps a connection's endpoint text to the address the
+    /// throttle keys on. A seam for tests, whose clients are all loopback.</summary>
+    internal Func<string?, System.Net.IPAddress?> AddressResolver { get; set; } = AuthThrottle.AddressOf;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -320,15 +327,28 @@ public sealed class MqttBrokerService(
             return;
         }
 
-        // Captured before the token check, which can take a while (one
-        // PBKDF2 per stored token): if the app's token changes meanwhile,
-        // this connection must not go through on the old one.
+        // Only while credentials are enforced: with auth off a bad password
+        // is accepted anyway, so there is nothing to protect or lock.
+        var address = AddressResolver(e.Endpoint);
+        if (authRequired && throttle.Check("mqtt", address) is { } wait)
+        {
+            // Not checked at all while locked out, so guessing costs the
+            // attacker time and us no hashing. Looks like any bad login.
+            e.ReasonCode = MQTTnet.Protocol.MqttConnectReasonCode.BadUserNameOrPassword;
+            logger.LogInformation("MQTT: rejected client {0} from {1} - too many wrong passwords; try again in {2} s", e.ClientId, address, (int)Math.Ceiling(wait.TotalSeconds));
+            return;
+        }
+
+        // Captured before the token check, which can take a moment: if the
+        // app's token changes meanwhile, this connection must not go
+        // through on the old one.
         var generation = TokenGeneration(e.UserName!);
         var app = await tokens.VerifyAsync(e.Password!);
         if (app is null
             || !string.Equals(app, e.UserName, StringComparison.OrdinalIgnoreCase)
             || TokenGeneration(app) != generation)
         {
+            if (app is null) throttle.Failed("mqtt", address);
             if (authRequired)
             {
                 e.ReasonCode = MQTTnet.Protocol.MqttConnectReasonCode.BadUserNameOrPassword;

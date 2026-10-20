@@ -182,6 +182,7 @@ builder.Services.AddSingleton<ForwarderWakeup>();
 builder.Services.AddSingleton<Database>();
 builder.Services.AddSingleton<AppTokenStore>();
 builder.Services.AddSingleton<AdminPasswordStore>();
+builder.Services.AddSingleton<AuthThrottle>();
 builder.Services.AddSingleton<InboundEventBus>();
 builder.Services.AddSingleton<OperationalMetrics>();
 builder.Services.AddSingleton<TransmissionAuditService>();
@@ -442,6 +443,15 @@ app.MapScalarApiReference(options =>
 });
 try
 {
+    try
+    {
+        var legacy = await app.Services.GetRequiredService<AppTokenStore>().LegacyAppNamesAsync();
+        if (legacy.Count > 0)
+            app.Logger.LogWarning(
+                "App tokens for {0} have not been used since this version; each is checked the slow way (one password hash) until its app next presents it. If an app is gone, reissue or revoke its token on the App tokens page.",
+                string.Join(", ", legacy));
+    }
+    catch (Exception ex) { app.Logger.LogDebug("Could not list legacy app tokens: {0}", ex.Message); }
     app.Run();
 }
 catch (Exception ex) when (IsFatalConfigError(ex))
