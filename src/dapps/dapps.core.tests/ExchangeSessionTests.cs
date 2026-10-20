@@ -36,7 +36,8 @@ public sealed class ExchangeSessionTests : IDisposable
     /// <summary>A session that dialled: the peer plays the answering node.</summary>
     private async Task<(ExchangeSession Session, LinePeer Peer, Task Run, WriteRecordingStream Wire)> CallerAsync(
         ExchangeSettings? settings = null, IBackhaulInbox? inbox = null, Action<ExchangeSession>? opened = null,
-        TimeSpan? maxLength = null, TimeSpan? inactivity = null, OutOfStepMemory? memory = null, TimeProvider? clock = null)
+        TimeSpan? maxLength = null, TimeSpan? inactivity = null, OutOfStepMemory? memory = null, TimeProvider? clock = null,
+        IRouteGossipPort? gossip = null)
     {
         var (ours, theirs) = await LoopbackPairAsync(Ct);
         var wire = new WriteRecordingStream(ours);
@@ -49,6 +50,7 @@ public sealed class ExchangeSessionTests : IDisposable
             InactivityTimeout = inactivity ?? TimeSpan.FromMinutes(3),
             Opened = opened,
             OutOfStepHistory = memory ?? new OutOfStepMemory(),
+            RouteGossip = gossip,
         };
         return (session, new LinePeer(theirs), session.RunAsync(Ct), wire);
     }
@@ -291,6 +293,116 @@ public sealed class ExchangeSessionTests : IDisposable
         session.Failure.Should().Contain("no exchange from");
         session.Established.Should().BeFalse();
         session.RedialAfter.Should().BeNull("we hung up ourselves");
+    }
+
+    [Fact]
+    public async Task ACallerWhoseRoutesRequestGetsNoAnswer_HangsUpAfterThreePromptWaits()
+    {
+        // #397: the prompt came, so the caller asked for the peer's routes,
+        // and nothing answered. BPQ had handed what we sent to a call of
+        // ours it still held for the pair from before, so it never went
+        // on air. Waiting out the 3-minute inactivity timeout kept that
+        // stale call, and BPQ refused every call the peer made meanwhile.
+        var clock = new WatchedClock();
+        var (session, peer, run, _) = await CallerAsync(clock: clock, gossip: new PullingGossip());
+        await clock.WaitForArmedAsync(1, Ct);
+        await peer.WriteLineAsync("DAPPSv1>", Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be("routes");
+        await clock.WaitForArmedAsync(2, Ct);
+
+        clock.Advance(Short * 3);
+        await run.WaitAsync(Patience, Ct);
+
+        session.Failure.Should().Contain("routes");
+        session.Established.Should().BeFalse();
+        session.RedialAfter.Should().BeNull("we hung up ourselves: the usual cooldown will do");
+    }
+
+    [Fact]
+    public async Task ACallerWhoseRoutesAnswerComesWithinThreePromptWaits_CarriesOn()
+    {
+        var clock = new WatchedClock();
+        var gossip = new PullingGossip();
+        var (session, peer, run, _) = await CallerAsync(clock: clock, gossip: gossip);
+        await clock.WaitForArmedAsync(1, Ct);
+        await peer.WriteLineAsync("DAPPSv1>", Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be("routes");
+        await clock.WaitForArmedAsync(2, Ct);
+
+        clock.Advance(Short * 2);   // more than one prompt wait, less than three
+        await peer.WriteLineAsync("end", Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().StartWith("exchange ");
+        await peer.WriteLineAsync(Rules(), Ct);
+        await WaitUntilAsync(() => session.Established || run.IsCompleted);
+        session.Established.Should().BeTrue();
+        run.IsCompleted.Should().BeFalse();
+        gossip.Pulled.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task ACallerWhoseRoutesAnswerKeepsComing_PastThreePromptWaits_CarriesOn()
+    {
+        // A long answer on a slow link: each line restarts the wait.
+        var clock = new WatchedClock();
+        var (session, peer, run, _) = await CallerAsync(clock: clock, gossip: new PullingGossip());
+        await clock.WaitForArmedAsync(1, Ct);
+        await peer.WriteLineAsync("DAPPSv1>", Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be("routes");
+        await clock.WaitForArmedAsync(2, Ct);
+
+        for (var i = 0; i < 4; i++)
+        {
+            var armed = clock.Armed;
+            clock.Advance(Short * 2);
+            await peer.WriteLineAsync($"route N0XY{i}-1 hops=2", Ct);
+            await clock.WaitForArmedAsync(armed + 1, Ct);
+        }
+        run.IsCompleted.Should().BeFalse("route lines kept coming, 8 prompt waits in all");
+        await peer.WriteLineAsync("end", Ct);
+
+        (await peer.ReadLineAsync(Ct)).Should().StartWith("exchange ");
+        await peer.WriteLineAsync(Rules(), Ct);
+        await WaitUntilAsync(() => session.Established || run.IsCompleted);
+        session.Established.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ARoutesRequestThatGotNoAnswer_IsNotMadeAgainOnTheNextSession()
+    {
+        var gossip = new PullingGossip();
+        var clock = new WatchedClock();
+        var (first, peer, run, _) = await CallerAsync(clock: clock, gossip: gossip);
+        await clock.WaitForArmedAsync(1, Ct);
+        await peer.WriteLineAsync("DAPPSv1>", Ct);
+        (await peer.ReadLineAsync(Ct)).Should().Be("routes");
+        await clock.WaitForArmedAsync(2, Ct);
+        clock.Advance(Short * 3);
+        await run.WaitAsync(Patience, Ct);
+        first.Failure.Should().Contain("routes");
+        gossip.Pulled.Should().Be(1, "the unanswered request counts as a pull");
+
+        var (second, nextPeer, _, _) = await CallerAsync(gossip: gossip);
+        await nextPeer.WriteLineAsync("DAPPSv1>", Ct);
+        (await nextPeer.ReadLineAsync(Ct)).Should().StartWith("exchange ", "the gossip gate holds the next pull back");
+        second.Failure.Should().BeNull();
+    }
+
+    /// <summary>A route gossip gate that wants the peer's routes until a pull is recorded.</summary>
+    private sealed class PullingGossip : IRouteGossipPort
+    {
+        public int Pulled { get; private set; }
+
+        public Task<bool> ShouldPullAsync(string remoteCallsign, CancellationToken ct) => Task.FromResult(Pulled == 0);
+
+        public Task ImportAsync(string advertiserCallsign, IReadOnlyList<DappsProtocolClient.GossipedRoute> routes, CancellationToken ct) =>
+            Task.CompletedTask;
+
+        public Task RecordPulledAsync(string remoteCallsign, CancellationToken ct)
+        {
+            Pulled++;
+            return Task.CompletedTask;
+        }
     }
 
     // ---- A call ended before the exchange (#204) ----
