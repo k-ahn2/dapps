@@ -1,4 +1,5 @@
 @inject SystemOptionsBackedTxGate TxGate
+@inject Microsoft.AspNetCore.Antiforgery.IAntiforgery Antiforgery
 @inject Microsoft.Extensions.Options.IOptionsMonitor<SystemOptions> SysOpts
 @{
     var title = ViewData["Title"] as string ?? "DAPPS";
@@ -21,6 +22,30 @@
         <meta http-equiv="refresh" content="@refreshSeconds" />
     }
     <title>@title</title>
+    @* #320: the admin API refuses state changes without an antiforgery
+       token. Every non-GET fetch() on a dashboard page carries it. *@
+    <meta name="request-verification-token" content="@Antiforgery.GetAndStoreTokens(Context).RequestToken" />
+    <script>
+        (function () {
+            var meta = document.querySelector('meta[name="request-verification-token"]');
+            var token = meta ? meta.content : '';
+            var original = window.fetch;
+            if (!token || !original) return;
+            window.fetch = function (input, init) {
+                var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+                var sameOrigin = false;
+                try { sameOrigin = new URL(url, location.href).origin === location.origin; } catch (e) { }
+                if (sameOrigin && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+                    init = Object.assign({}, init);
+                    var headers = new Headers(init.headers || (input && input.headers) || undefined);
+                    if (!headers.has('RequestVerificationToken')) headers.set('RequestVerificationToken', token);
+                    init.headers = headers;
+                }
+                return original.call(this, input, init);
+            };
+        })();
+    </script>
     <style>
         :root {
             /* Dark "operator console" palette - cool blue/slate with a
@@ -987,7 +1012,7 @@
                 <span class="reason">@TxGate.BlockReason</span>
                 @if (!TxGate.LocalAllowed)
                 {
-                    <form method="post" action="@Url.Content("~/TxControl/resume")" class="tx-stop-inline-form">
+                    <form method="post" action="@Url.Content("~/TxControl/resume")" class="tx-stop-inline-form">@Html.AntiForgeryToken()
                         <button type="submit">Resume TX</button>
                     </form>
                 }
@@ -1030,7 +1055,7 @@
             <div class="topbar-actions">
                 @if (TxGate.TxAllowed)
                 {
-                    <form method="post" action="@Url.Content("~/TxControl/stop")" class="tx-stop-inline-form">
+                    <form method="post" action="@Url.Content("~/TxControl/stop")" class="tx-stop-inline-form">@Html.AntiForgeryToken()
                         <button type="submit" class="tx-killbtn" title="Stop all transmissions immediately">
                             <span class="led"></span> Stop TX
                         </button>
