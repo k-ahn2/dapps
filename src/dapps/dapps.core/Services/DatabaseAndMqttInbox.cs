@@ -16,16 +16,48 @@ namespace dapps.core.Services;
 /// over a DAPPSv1 session or a MeshCore datagram. The bearer-specific
 /// receive layer is the one that called <see cref="DeliverAsync"/>.
 /// </summary>
-public sealed class DatabaseAndMqttInbox(
-    Database database,
-    MqttBrokerService mqtt,
-    InboundEventBus events,
-    IOptionsMonitor<SystemOptions> options,
-    IRoutingAlgorithm routingAlgorithm,
-    IRoutingContext routingContext,
-    TimeProvider timeProvider,
-    ILogger<DatabaseAndMqttInbox> logger) : IBackhaulInbox
+public sealed class DatabaseAndMqttInbox : IBackhaulInbox
 {
+    private readonly Database database;
+    private readonly MqttBrokerService mqtt;
+    private readonly InboundEventBus events;
+    private readonly IOptionsMonitor<SystemOptions> options;
+    private readonly IRoutingAlgorithm routingAlgorithm;
+    private readonly IRoutingContext routingContext;
+    private readonly TimeProvider timeProvider;
+    private readonly ILogger<DatabaseAndMqttInbox> logger;
+
+    public DatabaseAndMqttInbox(
+        Database database,
+        MqttBrokerService mqtt,
+        InboundEventBus events,
+        IOptionsMonitor<SystemOptions> options,
+        IRoutingAlgorithm routingAlgorithm,
+        IRoutingContext routingContext,
+        TimeProvider timeProvider,
+        ILogger<DatabaseAndMqttInbox> logger)
+    {
+        this.database = database;
+        this.mqtt = mqtt;
+        this.events = events;
+        this.options = options;
+        this.routingAlgorithm = routingAlgorithm;
+        this.routingContext = routingContext;
+        this.timeProvider = timeProvider;
+        this.logger = logger;
+
+        // Messages an app here sends to an app on this node come through
+        // the same storing and publishing as an arrival (#288). There is
+        // one inbox per node.
+        database.LocalSubmissionHandler = message =>
+            AcceptAsync(ToBackhaul(message), message.SourceCallsign, CancellationToken.None);
+    }
+
+    private static BackhaulMessage ToBackhaul(DbMessage m) => new(
+        Id: m.Id, Destination: m.Destination, Salt: m.Salt, Ttl: m.Ttl, Payload: m.Payload,
+        Originator: m.OriginatorCallsign,
+        StreamId: m.StreamId, StreamSeq: m.StreamSeq, StreamGapTimeoutSeconds: m.StreamGapTimeoutSeconds);
+
     /// <summary>Only a stored message counts, and never one without a
     /// salt: those aren't remembered.</summary>
     public async Task<bool> HasAsync(string id, long? salt, int length, CancellationToken ct) =>
@@ -327,6 +359,25 @@ public sealed class DatabaseAndMqttInbox(
     /// </summary>
     private async Task DeliverOrderedAsync(BackhaulMessage message, string sourceCallsign, string originator, string headersJson, CancellationToken ct)
     {
+        // One at a time per (sender, stream): the cursor is read, then
+        // written, so two at once would overwrite each other's advance.
+        var lockKey = (!string.IsNullOrEmpty(message.Originator) ? message.Originator : sourceCallsign) + "|" + message.StreamId;
+        var gate = streamLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            await DeliverOrderedLockedAsync(message, sourceCallsign, originator, headersJson, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> streamLocks = new(StringComparer.Ordinal);
+
+    private async Task DeliverOrderedLockedAsync(BackhaulMessage message, string sourceCallsign, string originator, string headersJson, CancellationToken ct)
+    {
         var localCall = options.CurrentValue.Callsign;
         var streamId = message.StreamId!;
         var sn = message.StreamSeq!.Value;
@@ -505,6 +556,22 @@ public sealed class DatabaseAndMqttInbox(
     /// </summary>
     internal async Task SkipGapAsync(DbStreamRecvState recv, CancellationToken ct)
     {
+        var gate = streamLocks.GetOrAdd(recv.SenderCallsign + "|" + recv.StreamId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            await SkipGapLockedAsync(recv, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task SkipGapLockedAsync(DbStreamRecvState recv, CancellationToken ct)
+    {
+        // The caller's copy may be stale by the time we hold the lock.
+        recv = await database.GetStreamRecvStateAsync(recv.LocalCallsign, recv.SenderCallsign, recv.StreamId) ?? recv;
         var pending = await database.GetPendingInOrderAsync(recv.SenderCallsign, recv.StreamId);
         var firstAbove = pending.FirstOrDefault(p => p.StreamSeq is { } s && s >= recv.NextExpectedSeq);
         if (firstAbove?.StreamSeq is null)

@@ -109,6 +109,18 @@ if msg_id in seen:
 
 For this tutorial an in-memory set is fine - restart the script and it'll happily reply to old messages again, but that's exactly the bug the persistent store fixes when you're ready for a real app.
 
+## Step 4b: don't answer a greeting
+
+A message you send to your own callsign is delivered back to you like any other, and so is your app's reply to it. If the app replied to everything, it would greet its own greeting for ever. So leave greetings alone, and just ack them:
+
+```python
+if payload.startswith("hello, "):
+    client.publish("dapps/ack/hello", msg_id.encode("utf-8"), qos=1)
+    return
+```
+
+A real app needs a rule like this too: decide which messages get a reply, so two copies of your app (or your app and itself) can't answer each other for ever.
+
 ## Step 5: reply
 
 Replying is symmetric to receiving - publish to `dapps/out/<app>/<destination-callsign>`. The destination is whoever sent us the message; that's the `dapps-source` user property we just read.
@@ -165,7 +177,14 @@ You should see, in the script's terminal:
 -> reply sent to <your-callsign>
 ```
 
-The script published a reply, and because the destination was your own callsign, your DAPPS forwarded it straight back into `dapps/in/hello`. To watch it round-trip without re-triggering your handler, subscribe with `mosquitto_sub` in a separate terminal:
+The script published a reply, and because the destination was your own callsign, your DAPPS delivered it straight back into `dapps/in/hello`, just as if it had come from another node. The script sees it's a greeting and just acks it, so you'll also see:
+
+```
+<- def5678 from <your-callsign>: 'hello, world!'
+   (a greeting, not replying)
+```
+
+To watch the messages go by without running the script, subscribe with `mosquitto_sub` in a separate terminal:
 
 ```bash
 mosquitto_sub -h 127.0.0.1 -V mqttv5 -u hello -P "$DAPPS_TOKEN" -t 'dapps/in/hello' -F '%P\n%p'
