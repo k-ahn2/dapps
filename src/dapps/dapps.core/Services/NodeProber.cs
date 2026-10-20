@@ -87,6 +87,11 @@ public sealed class NodeProber(
         {
             return await PingOpenSessionAsync(open, remoteCallsign, bearerPort, at, ct);
         }
+        // Refused before dialling, so nothing goes on the air (#309).
+        if (ConnectScriptRunner.Refusal(connectScript, logger) is { } refused)
+        {
+            return new ProbeResult(remoteCallsign, bearerPort, false, $"connect-script: {refused}", at, peers);
+        }
         try
         {
             await using var connection = await transport.ConnectAsync(
@@ -213,6 +218,21 @@ public sealed class NodeProber(
     {
         var at = timeProvider.GetUtcNow().UtcDateTime;
         IReadOnlyList<DappsProtocolClient.DiscoveredPeerInfo> peers = [];
+        // The command is typed at the far node's prompt under our call.
+        // A value saved by an older DAPPS wasn't checked, and a CR in it
+        // would make that node run a second command (#309): don't dial.
+        if (NodePromptText.ApplicationCommandError(applicationCommand) is { } commandError)
+        {
+            if (NodePromptText.FirstTime("command:" + applicationCommand))
+            {
+                logger.LogWarning(
+                    "Node-prompt probe of {0} refused, nothing sent: the application command '{1}' is not valid. {2} Fix it on the Settings page. " +
+                    "(Logged once; every node-prompt probe is refused until then.)",
+                    remoteNodeCall, NodePromptText.Printable(applicationCommand), commandError);
+            }
+            return new ProbeResult(remoteNodeCall, bearerPort, false,
+                $"application command refused: {commandError}", at, peers);
+        }
         if (FindOpenSession(remoteNodeCall) is { } open)
         {
             return await PingOpenSessionAsync(open, remoteNodeCall, bearerPort, at, ct);

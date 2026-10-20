@@ -230,6 +230,41 @@ public sealed class NodeProberTests
     }
 
     [Theory]
+    [InlineData("DAPPS\rC GB7XXX")]
+    [InlineData("C GB7XXX")]
+    [InlineData("")]
+    public async Task ProbeViaNodeCallAsync_ApplicationCommandThatIsNotOneWord_DoesNotDial(string command)
+    {
+        // A value stored before #309's check: typed at the far node's
+        // prompt it would run another command there under our call.
+        var transport = new FakeOutboundTransport("NODE:N0NODE} \r"u8.ToArray());
+        var prober = new NodeProber(transport, TimeProvider.System, NullLoggerFactory.Instance, NullLogger<NodeProber>.Instance);
+
+        var result = await prober.ProbeViaNodeCallAsync("N0US", "N0NODE", bearerPort: 1, CancellationToken.None,
+            applicationCommand: command);
+
+        result.Success.Should().BeFalse();
+        result.Error.Should().StartWith("application command refused:");
+        transport.Dialled.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ProbeAsync_StoredConnectScriptWithACr_DoesNotDial()
+    {
+        // #309: refused before the connect, so nothing goes on the air.
+        var transport = new FakeOutboundTransport("DAPPSv1>\n"u8.ToArray());
+        var prober = new NodeProber(transport, TimeProvider.System, NullLoggerFactory.Instance, NullLogger<NodeProber>.Instance);
+        var script = new dapps.client.ConnectScript([new dapps.client.ConnectScriptStep("DAPPS\rC G0EVIL", "DAPPSv1>")]);
+
+        var result = await prober.ProbeAsync("N0US", "N0THEM-3", bearerPort: 1, CancellationToken.None,
+            connectScript: script, connectVia: "N0NODE");
+
+        result.Success.Should().BeFalse();
+        result.Error.Should().StartWith("connect-script: refused, nothing sent:");
+        transport.Dialled.Should().BeEmpty();
+    }
+
+    [Theory]
     [InlineData(2.4, "2.4s")]
     [InlineData(42, "42s")]
     [InlineData(190, "3m10s")]
