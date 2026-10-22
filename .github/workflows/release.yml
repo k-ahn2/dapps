@@ -427,6 +427,12 @@ jobs:
           grep '^version:' pdn-app.yaml
           cp pdn-app.yaml dist/pdn-app.yaml
 
+      # Self-contained, so the runtime in each artifact is whichever SDK built it, and a stale
+      # build machine ships old security fixes. Fail the release instead. Checked here, where
+      # every binary and .deb is in one place before anything is uploaded or released.
+      - name: Check the bundled .NET runtime is the latest patch
+        run: python3 scripts/check-bundled-runtime.py dist/dapps-* dist/*.deb
+
       - name: Checksums
         working-directory: dist
         run: |
