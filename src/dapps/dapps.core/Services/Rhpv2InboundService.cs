@@ -92,7 +92,14 @@ public sealed class Rhpv2InboundService(
                 var cycleCt = cycleTokenSource.Token;
                 try
                 {
-                    await RunOnce(cycleCt);
+                    try
+                    {
+                        await RunOnce(cycleCt);
+                    }
+                    finally
+                    {
+                        metrics.RecordNodeLinkOpen("rhpv2", false);
+                    }
 
                     // Clean return - idle-gated on missing config only
                     // (a genuine bind/listen failure now throws - see
@@ -207,6 +214,7 @@ public sealed class Rhpv2InboundService(
         var (listenerHandle, boundCallsign) = bound.Value;
         logger.LogInformation("RHP inbound: listener bound to {call} on handle {h}", boundCallsign, listenerHandle);
         reconnect.RecordSuccess();
+        metrics.RecordNodeLinkOpen("rhpv2", true);
         PublishBackoffState();
 
         var sessions = new ConcurrentDictionary<int, MultiplexedAgwSessionStream>();

@@ -156,7 +156,14 @@ public sealed class AgwInboundService(
             var cycleCt = cycleTokenSource.Token;
             try
             {
-                await RunOnce(cycleCt);
+                try
+                {
+                    await RunOnce(cycleCt);
+                }
+                finally
+                {
+                    metrics.RecordNodeLinkOpen("agw", false);
+                }
 
                 // Reached here only via a clean return - idle-gated on
                 // missing config, or the cycle token's while-condition
@@ -281,6 +288,7 @@ public sealed class AgwInboundService(
         // connection is more than a TCP handshake.
         reconnect.RecordSuccess();
         PublishBackoffState();
+        if (!listenOnly) metrics.RecordNodeLinkOpen("agw", true);
         logger.LogDebug(listenOnly ? "AGW inbound: 'G' answered" : "AGW inbound: 'X' ack");
 
         // Before it is published, so a subscriber hears it from the start.
