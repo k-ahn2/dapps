@@ -452,11 +452,18 @@ public class OutboundMessageManager(
         // here on, as a session's batch does: what arrives meanwhile goes
         // by hand-off, or on a later run once this send has ended.
         batch.Detached = true;
-        var key = LinkKey(route);
-        backgroundSends[key] = send;
         logger.LogInformation(
             "Sending to {0} through {1} is taking more than {2:F0}s; leaving it to finish in the background and going on with the rest",
             route.Callsign, route.DialCallsign, SendPatience.TotalSeconds);
+        TrackInBackground(route, send);
+    }
+
+    /// <summary>Later runs leave <paramref name="route"/>'s link alone
+    /// until <paramref name="send"/> ends; then the forwarder is woken.</summary>
+    private void TrackInBackground(BackhaulRoute route, Task send)
+    {
+        var key = LinkKey(route);
+        backgroundSends[key] = send;
         _ = send.ContinueWith(t =>
         {
             backgroundSends.TryRemove(new KeyValuePair<string, Task>(key, send));
@@ -822,28 +829,16 @@ public class OutboundMessageManager(
 
         foreach (var route in flood.Routes)
         {
-            // One neighbour's trouble mustn't stop the copies to the
-            // others (#263). A copy whose send throws counts as a failed
-            // send (deferred if the kill switch refused it).
-            (BackhaulSendResult Result, TimeSpan Elapsed)? sent;
-            try
+            if (RidesASession(route) && backgroundSends.TryGetValue(LinkKey(route), out var busy))
             {
-                sent = await FloodCopyAsync(message, flood, residualTtl, originator, route, optionsValue, stoppingToken);
+                // A send left in the background still has this link: a
+                // copy now would only be turned away, and lost. It goes
+                // once that send has ended, and holds the link till then.
+                logger.LogInformation("Flood of {0}: the link to {1} is still busy; its copy goes when it's free", message.Id, route.Callsign);
+                TrackInBackground(route, FloodCopyWhenFreeAsync(busy, message, flood, originator, route, optionsValue, stoppingToken));
+                continue;
             }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                logger.LogError(ex, "Flood of {0}: the copy for {1} failed", message.Id, route.Callsign);
-                sent = (ex is TxStoppedException ? BackhaulSendResult.Defer(ex.Message) : BackhaulSendResult.Fail(ex.Message), TimeSpan.Zero);
-            }
-            if (sent is not { } s) continue;
-            try
-            {
-                await RecordFloodOutcomeAsync(message, route, flood.HopBudget, s.Result, s.Elapsed, stoppingToken);
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                logger.LogError(ex, "Flood of {0}: could not record the outcome for {1}", message.Id, route.Callsign);
-            }
+            await SendFloodCopyAsync(message, flood, residualTtl, originator, route, optionsValue, stoppingToken);
         }
 
         // Mark the message forwarded so it doesn't keep flooding on
@@ -851,6 +846,50 @@ public class OutboundMessageManager(
         // effectively lost - that's correct semantics; floods are
         // best-effort.
         await database.MarkMessageAsForwarded(message.Id);
+    }
+
+    private async Task FloodCopyWhenFreeAsync(
+        Task busy, DbMessage message, RouteDecision.FloodToNeighbours flood,
+        string? originator, BackhaulRoute route, SystemOptions optionsValue, CancellationToken stoppingToken)
+    {
+        try { await busy; }
+        catch { /* That send's own outcome is recorded where it ran. */ }
+        stoppingToken.ThrowIfCancellationRequested();
+        var residualTtl = TtlMath.Residual(message.Ttl, message.CreatedAt, DateTime.UtcNow);
+        if (residualTtl is <= 0)
+        {
+            logger.LogInformation("Flood of {0}: not sending the copy for {1}, its ttl ran out while the link was busy", message.Id, route.Callsign);
+            return;
+        }
+        await SendFloodCopyAsync(message, flood, residualTtl, originator, route, optionsValue, stoppingToken);
+    }
+
+    private async Task SendFloodCopyAsync(
+        DbMessage message, RouteDecision.FloodToNeighbours flood, int? residualTtl,
+        string? originator, BackhaulRoute route, SystemOptions optionsValue, CancellationToken stoppingToken)
+    {
+        // One neighbour's trouble mustn't stop the copies to the
+        // others (#263). A copy whose send throws counts as a failed
+        // send (deferred if the kill switch refused it).
+        (BackhaulSendResult Result, TimeSpan Elapsed)? sent;
+        try
+        {
+            sent = await FloodCopyAsync(message, flood, residualTtl, originator, route, optionsValue, stoppingToken);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            logger.LogError(ex, "Flood of {0}: the copy for {1} failed", message.Id, route.Callsign);
+            sent = (ex is TxStoppedException ? BackhaulSendResult.Defer(ex.Message) : BackhaulSendResult.Fail(ex.Message), TimeSpan.Zero);
+        }
+        if (sent is not { } s) return;
+        try
+        {
+            await RecordFloodOutcomeAsync(message, route, flood.HopBudget, s.Result, s.Elapsed, stoppingToken);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            logger.LogError(ex, "Flood of {0}: could not record the outcome for {1}", message.Id, route.Callsign);
+        }
     }
 
     /// <summary>

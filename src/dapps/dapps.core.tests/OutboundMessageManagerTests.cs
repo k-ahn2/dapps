@@ -1904,6 +1904,50 @@ public sealed class OutboundMessageManagerTests : IAsyncLifetime
         (backoff.RecordFailure("N0VIA") - clock.GetUtcNow()).Should().Be(first, "the streak started again");
     }
 
+    [Fact]
+    public async Task DoRun_AFloodCopyForALinkStillBusyInTheBackground_GoesWhenTheLinkIsFree()
+    {
+        // On master the run waited for the send to end before flooding,
+        // so the copy went. Sent now, it would be turned away and lost.
+        var ct = TestContext.Current.CancellationToken;
+        var busyRoute = new BackhaulRoute("N0AAA", BearerPort: 1);
+        var otherRoute = new BackhaulRoute("N0BBB", BearerPort: 1);
+        var algorithm = new ByDestinationAlgorithm(m => m.Destination == "app@N0AAA"
+            ? new RouteDecision.NextHop(busyRoute)
+            : new RouteDecision.FloodToNeighbours([busyRoute, otherRoute], HopBudget: 3));
+        var bearer = new GatedBackhaul(holdFor: "N0AAA");
+        var clock = new FakeTimeProvider();
+        var wakeup = new ForwarderWakeup();
+        var m = new OutboundMessageManager(database, NullLoggerFactory.Instance, optionsMonitor, [bearer], algorithm, routingContext,
+            wakeup: wakeup) { TimeProvider = clock };
+        InsertMessage(id: "aaa0001", ttl: null, createdAt: DateTime.UtcNow.AddSeconds(-10), destination: "app@N0AAA");
+        InsertMessage(id: "fld0001", ttl: null, createdAt: DateTime.UtcNow.AddSeconds(-5), destination: "app@N0FAR");
+
+        await RunPastPatienceAsync(m, bearer, clock, ct);
+
+        bearer.FloodCopies.Should().Equal([("fld0001", "N0BBB")], "N0AAA's link is still busy");
+        (await database.GetPendingOutboundMessages()).Select(r => r.Id).Should().Equal(["aaa0001"], "the flood is done with, as floods are");
+
+        // A run meanwhile leaves the link alone, flood copy and all.
+        await m.DoRun(ct);
+        bearer.FloodCopies.Should().ContainSingle();
+
+        bearer.Gate.SetResult(BackhaulSendResult.Ok());
+        await WaitUntilAsync(() => Task.FromResult(bearer.FloodCopies.Count == 2), ct);
+        bearer.FloodCopies.Should().Equal([("fld0001", "N0BBB"), ("fld0001", "N0AAA")]);
+        (await wakeup.WaitAsync(TimeSpan.FromSeconds(5), TimeProvider.System, ct)).Should().BeTrue();
+    }
+
+    /// <summary>Routes each message by a rule.</summary>
+    private sealed class ByDestinationAlgorithm(Func<DbMessage, RouteDecision> decide) : IRoutingAlgorithm
+    {
+        public Task<RouteDecision> ResolveAsync(DbMessage message, IRoutingContext ctx, CancellationToken ct) => Task.FromResult(decide(message));
+        public Task ObserveInboundAsync(BackhaulMessage message, string linkSourceCallsign, IRoutingContext ctx, CancellationToken ct) => Task.CompletedTask;
+        public Task ObserveForwardOutcomeAsync(DbMessage message, BackhaulRoute attemptedRoute, BackhaulSendResult result, IRoutingContext ctx, CancellationToken ct) => Task.CompletedTask;
+        public Task ObserveProbeOutcomeAsync(string askedPeerCallsign, IReadOnlyList<dapps.client.DappsProtocolClient.DiscoveredPeerInfo> peers, IRoutingContext ctx, CancellationToken ct) => Task.CompletedTask;
+        public Task RunAsync(IRoutingContext ctx, CancellationToken ct) => Task.CompletedTask;
+    }
+
     private static async Task WaitUntilAsync(Func<Task<bool>> condition, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow.AddSeconds(5);
@@ -1934,9 +1978,20 @@ public sealed class OutboundMessageManagerTests : IAsyncLifetime
 
         public bool CanHandle(BackhaulRoute route) => true;
 
+        private readonly List<(string Id, string Callsign)> floodCopies = [];
+
+        /// <summary>Flood copies sent, one message at a time.</summary>
+        public IReadOnlyList<(string Id, string Callsign)> FloodCopies
+        {
+            get { lock (floodCopies) return [.. floodCopies]; }
+        }
+
         public Task<BackhaulSendResult> SendAsync(
-            BackhaulMessage message, BackhaulRoute route, string localCallsign, CancellationToken ct) =>
-            throw new InvalidOperationException("the forwarder should hand this bearer batches");
+            BackhaulMessage message, BackhaulRoute route, string localCallsign, CancellationToken ct)
+        {
+            lock (floodCopies) floodCopies.Add((message.Id, route.Callsign));
+            return Task.FromResult(BackhaulSendResult.Ok());
+        }
 
         public async Task SendBatchAsync(BackhaulRoute route, string localCallsign, IBackhaulBatch batch, CancellationToken ct)
         {
