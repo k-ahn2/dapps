@@ -1351,6 +1351,23 @@ public sealed class OutboundMessageManagerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task DoRun_TheExactSsidsCall_TakesTheBatch_OverAnotherSsids()
+    {
+        // N0DEST and N0DEST-6 have both called: the exact call+SSID wins.
+        var directory = new SessionDirectory();
+        var other = await EstablishedInboundSessionAsync("N0DEST-6", directory);
+        var exact = await EstablishedInboundSessionAsync("N0DEST", directory);
+        var m = new OutboundMessageManager(database, NullLoggerFactory.Instance, optionsMonitor, [backhaul], routingAlgorithm, routingContext,
+            peerSessions: new PeerSessionRegistry(), openSessions: directory);
+        InsertMessage(id: "xsid004", ttl: null, createdAt: DateTime.UtcNow);
+
+        await m.DoRun(TestContext.Current.CancellationToken);
+
+        (await exact.ReadLineAsync(TestContext.Current.CancellationToken)).Should().StartWith("msg xsid004 ");
+        backhaul.Sent.Should().BeEmpty("nothing was dialled");
+    }
+
+    [Fact]
     public async Task DoRun_MailForANodeThatHasCalledUs_GoesOnItsSession_EvenWithNoRoute()
     {
         // What `rev` used to collect: we have no route to N0FAR, but it's
