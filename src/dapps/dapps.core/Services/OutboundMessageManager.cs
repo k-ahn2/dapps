@@ -33,7 +33,8 @@ public class OutboundMessageManager(
     TransmissionAuditService? transmissionAudit = null,
     OutboundDestinationBackoff? destinationBackoff = null,
     PeerSessionRegistry? peerSessions = null,
-    SessionDirectory? openSessions = null)
+    SessionDirectory? openSessions = null,
+    ForwarderWakeup? wakeup = null)
 {
     private readonly ILogger logger = loggerFactory.CreateLogger<OutboundMessageManager>();
     private readonly IReadOnlyList<IDappsBackhaul> backhauls = backhauls.ToList();
@@ -80,6 +81,29 @@ public class OutboundMessageManager(
     /// <summary>How long a hand-off holds a message back from later runs,
     /// in case the session never gets to it.</summary>
     internal TimeSpan HandOffPatience { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// How long a run waits on one neighbour's send before going on to the
+    /// others and leaving that send to finish in the background. A dial
+    /// can take minutes to fail (the node gives up on a dead RF link after
+    /// its retries, or not at all for 3 minutes), and the run serves one
+    /// neighbour at a time: without this, every other neighbour waited.
+    /// </summary>
+    internal TimeSpan SendPatience { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Sends left running in the background by <see cref="SendPatience"/>,
+    /// by the link they dial (<see cref="LinkKey"/>). Later runs leave
+    /// that link alone until its send ends: dialling it again would only
+    /// collide with the call still in progress.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, Task> backgroundSends = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The node a route dials, and on which port. Neighbours
+    /// reached through the same <see cref="BackhaulRoute.ConnectVia"/>
+    /// share it.</summary>
+    private static string LinkKey(BackhaulRoute route) =>
+        string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{route.DialCallsign}|{route.BearerPort}");
 
     /// <summary>Outcomes arrive from background sessions as well as from
     /// the run itself; routing and metrics see them one at a time.</summary>
@@ -361,11 +385,27 @@ public class OutboundMessageManager(
             return;
         }
 
+        if (backgroundSends.ContainsKey(LinkKey(route)))
+        {
+            logger.LogDebug(
+                "Leaving {0} message(s) for {1} queued: a send through {2} from an earlier run is still going",
+                batch.Count, route.Callsign, route.DialCallsign);
+            return;
+        }
+
         if (destinationBackoff.IsInCooldown(route.Callsign, out var nextRetryAtUtc))
         {
             logger.LogDebug(
                 "Skipping {0} message(s) for {1}: in reconnect cooldown until {2:O}",
                 batch.Count, route.Callsign, nextRetryAtUtc);
+            return;
+        }
+
+        if (ViaOf(route) is { } via && destinationBackoff.IsInCooldown(via, out var viaRetryAtUtc))
+        {
+            logger.LogDebug(
+                "Skipping {0} message(s) for {1}: {2}, which it's reached through, is in reconnect cooldown until {3:O}",
+                batch.Count, route.Callsign, via, viaRetryAtUtc);
             return;
         }
 
@@ -382,6 +422,41 @@ public class OutboundMessageManager(
             return;
         }
 
+        var send = SendAndCompleteAsync(backhaul, batch, optionsValue, stoppingToken);
+        // Not linked to stoppingToken: when that's cancelled, the send
+        // ends with it, and goes the usual way.
+        using (var waiting = new CancellationTokenSource())
+        {
+            var finished = await Task.WhenAny(send, Task.Delay(SendPatience, waiting.Token));
+            await waiting.CancelAsync();
+            if (finished == send)
+            {
+                await send;
+                return;
+            }
+        }
+
+        // Still dialling, or still in the session: the others shouldn't
+        // wait for it. The batch hands out only what it already has from
+        // here on, as a session's batch does: what arrives meanwhile goes
+        // by hand-off, or on a later run once this send has ended.
+        batch.Detached = true;
+        var key = LinkKey(route);
+        backgroundSends[key] = send;
+        logger.LogInformation(
+            "Sending to {0} through {1} is taking more than {2:F0}s; leaving it to finish in the background and going on with the rest",
+            route.Callsign, route.DialCallsign, SendPatience.TotalSeconds);
+        _ = send.ContinueWith(_ =>
+        {
+            backgroundSends.TryRemove(key, out var _);
+            // Whatever was held back for this link can go now.
+            wakeup?.Wake();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task SendAndCompleteAsync(IDappsBackhaul backhaul, NextHopBatch batch, SystemOptions optionsValue, CancellationToken stoppingToken)
+    {
+        var route = batch.Route;
         try
         {
             await backhaul.SendBatchAsync(route, optionsValue.Callsign, batch, stoppingToken);
@@ -396,6 +471,11 @@ public class OutboundMessageManager(
             await batch.CompleteUnansweredAsync(ex, stoppingToken);
         }
     }
+
+    /// <summary>The node a route is reached through, when it isn't the
+    /// neighbour itself.</summary>
+    private static string? ViaOf(BackhaulRoute route) =>
+        route.ConnectVia is { } via && !string.Equals(via, route.Callsign, StringComparison.OrdinalIgnoreCase) ? via : null;
 
     private BackhaulMessage ToBackhaulMessage(DbMessage message, int? residualTtl, IReadOnlyList<string>? sourceRoute) =>
         new(
@@ -487,10 +567,14 @@ public class OutboundMessageManager(
                 activityTracker?.RecordTransmission();
                 await database.MarkMessageAsForwarded(message.Id);
                 destinationBackoff.RecordSuccess(route.Callsign);
+                if (ViaOf(route) is { } via) destinationBackoff.RecordSuccess(via);
                 refusals.TryRemove(RefusalKey(message), out _);
             }
             else
             {
+                // The node we dial never answered: every neighbour reached
+                // through it would fail the same way, so they wait too.
+                if (result.DialFailed && ViaOf(route) is { } via) destinationBackoff.RecordFailure(via, result.MinCooldown);
                 var nextRetryAtUtc = destinationBackoff.RecordFailure(route.Callsign, result.MinCooldown);
                 logger.LogError("Failed to forward message {0} to {1} via {2}: {3} (retrying no earlier than {4:O})",
                     message.Id, route.Callsign, backhaulName, result.Error, nextRetryAtUtc);
@@ -547,10 +631,16 @@ public class OutboundMessageManager(
 
         /// <summary>
         /// Handed to a session that sends in the background, while this
-        /// and later runs go on. It then only sends what it was given:
-        /// looking at the queue again would race the run that made it.
+        /// and later runs go on, or left sending in the background after
+        /// <see cref="SendPatience"/>. It then only sends what it was
+        /// given: looking at the queue again would race the run that made it.
         /// </summary>
-        public bool Detached { get; set; }
+        public bool Detached
+        {
+            get => Volatile.Read(ref detached);
+            set => Volatile.Write(ref detached, value);
+        }
+        private bool detached;
 
         /// <summary>Only for a session already open: never dialled for.</summary>
         public bool HandOffOnly { get; init; }
@@ -657,8 +747,12 @@ public class OutboundMessageManager(
             foreach (var row in await owner.PendingOutboundQueuedSinceAsync(runStartedAt))
             {
                 // Once looked at, a message is the next run's to handle
-                // if it isn't ours: no second look this run.
-                if (!seen.Add(row.Id) || owner.inFlight.ContainsKey(row.Id)) continue;
+                // if it isn't ours: no second look this run. Locked: a
+                // batch left sending in the background may still be here
+                // while the run goes on to the next one.
+                bool firstLook;
+                lock (seen) firstLook = seen.Add(row.Id);
+                if (!firstLook || owner.inFlight.ContainsKey(row.Id)) continue;
 
                 // Expired: the next run drops it with the usual log line.
                 var residualTtl = TtlMath.Residual(row.Ttl, row.CreatedAt, DateTime.UtcNow);

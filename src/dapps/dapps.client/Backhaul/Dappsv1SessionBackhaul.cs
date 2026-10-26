@@ -242,7 +242,7 @@ public sealed class Dappsv1SessionBackhaul : IDappsBackhaul
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             logger.LogError(ex, "Backhaul send failed for {0} to {1}", first.Id, route.Callsign);
-            await batch.CompleteAsync(first, BackhaulSendResult.Fail(ex.Message), sw.Elapsed, ct);
+            await batch.CompleteAsync(first, BackhaulSendResult.Fail(ex.Message) with { DialFailed = true }, sw.Elapsed, ct);
             return;
         }
 
