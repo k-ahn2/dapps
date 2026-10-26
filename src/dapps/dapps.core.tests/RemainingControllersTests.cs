@@ -82,6 +82,47 @@ public sealed class RemainingControllersTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task NeighboursController_PreviousCallsign_RenamesTheNeighbour()
+    {
+        var ctrl = new NeighboursController(database);
+        await ctrl.Upsert(new NeighbourModel("g7xyz-9", Port: 1, ConnectScript: "DAPPS|DAPPSv1>", ConnectVia: "GB7BDH"));
+
+        (await ctrl.Upsert(new NeighbourModel("g7xyz-3", Port: 2, ConnectScript: "DAPPS|DAPPSv1>", ConnectVia: "GB7BDH", PreviousCallsign: "g7xyz-9")))
+            .Should().BeOfType<NoContentResult>();
+
+        var list = (await ctrl.List()).ToList();
+        list.Should().ContainSingle();
+        list[0].Callsign.Should().Be("G7XYZ-3");
+        list[0].Port.Should().Be(2);
+        list[0].ConnectVia.Should().Be("GB7BDH");
+    }
+
+    [Fact]
+    public async Task NeighboursController_RenameOntoAnotherNeighbour_IsRefused()
+    {
+        var ctrl = new NeighboursController(database);
+        await ctrl.Upsert(new NeighbourModel("G7XYZ-9", Port: 1));
+        await ctrl.Upsert(new NeighbourModel("G7XYZ-3", Port: 2));
+
+        (await ctrl.Upsert(new NeighbourModel("G7XYZ-3", Port: 1, PreviousCallsign: "G7XYZ-9")))
+            .Should().BeOfType<ConflictObjectResult>();
+
+        var list = (await ctrl.List()).ToList();
+        list.Should().HaveCount(2, "the refused rename changes neither row");
+        list.Single(n => n.Callsign == "G7XYZ-3").Port.Should().Be(2);
+    }
+
+    [Fact]
+    public async Task NeighboursController_RenameOfAMissingNeighbour_IsNotFound()
+    {
+        var ctrl = new NeighboursController(database);
+
+        (await ctrl.Upsert(new NeighbourModel("G7XYZ-3", Port: 1, PreviousCallsign: "G7XYZ-9")))
+            .Should().BeOfType<NotFoundObjectResult>();
+        (await ctrl.List()).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task NeighboursController_EmptyCallsign_BadRequest()
     {
         var ctrl = new NeighboursController(database);
