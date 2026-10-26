@@ -91,6 +91,9 @@ public class OutboundMessageManager(
     /// </summary>
     internal TimeSpan SendPatience { get; set; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>The clock <see cref="SendPatience"/> runs on.</summary>
+    internal TimeProvider TimeProvider { get; set; } = TimeProvider.System;
+
     /// <summary>
     /// Sends left running in the background by <see cref="SendPatience"/>,
     /// by the link they dial (<see cref="LinkKey"/>). Later runs leave
@@ -422,19 +425,27 @@ public class OutboundMessageManager(
             return;
         }
 
-        var send = SendAndCompleteAsync(backhaul, batch, optionsValue, stoppingToken);
         // Not linked to stoppingToken: when that's cancelled, the send
-        // ends with it, and goes the usual way.
+        // ends with it, and goes the usual way. The wait starts before the
+        // send does, so it's running by the time the bearer is.
         using (var waiting = new CancellationTokenSource())
         {
-            var finished = await Task.WhenAny(send, Task.Delay(SendPatience, waiting.Token));
+            var patience = Task.Delay(SendPatience, TimeProvider, waiting.Token);
+            var send = SendAndCompleteAsync(backhaul, batch, optionsValue, stoppingToken);
+            var finished = await Task.WhenAny(send, patience);
             await waiting.CancelAsync();
             if (finished == send)
             {
                 await send;
                 return;
             }
+            LeaveInBackground(batch, send);
         }
+    }
+
+    private void LeaveInBackground(NextHopBatch batch, Task send)
+    {
+        var route = batch.Route;
 
         // Still dialling, or still in the session: the others shouldn't
         // wait for it. The batch hands out only what it already has from
@@ -446,9 +457,11 @@ public class OutboundMessageManager(
         logger.LogInformation(
             "Sending to {0} through {1} is taking more than {2:F0}s; leaving it to finish in the background and going on with the rest",
             route.Callsign, route.DialCallsign, SendPatience.TotalSeconds);
-        _ = send.ContinueWith(_ =>
+        _ = send.ContinueWith(t =>
         {
-            backgroundSends.TryRemove(key, out var _);
+            backgroundSends.TryRemove(new KeyValuePair<string, Task>(key, send));
+            // Only on shutdown: anything else is caught and recorded.
+            if (t.Exception is { } ex) logger.LogDebug(ex, "Background send to {0} ended with an exception", route.Callsign);
             // Whatever was held back for this link can go now.
             wakeup?.Wake();
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
